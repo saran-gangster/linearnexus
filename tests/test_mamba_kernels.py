@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import jax
+import jax.numpy as jnp
+
+from linearnexus.kernels import (
+    KernelMode,
+    MambaKernelInputs,
+    MambaKernelParams,
+    MambaKernelState,
+    MambaPallasKernel,
+    MambaReferenceKernel,
+    PALLAS_AVAILABLE,
+)
+
+
+def _pallas_ready() -> bool:
+    return PALLAS_AVAILABLE and any(device.platform == "gpu" for device in jax.devices())
+
+
+@pytest.mark.skipif(not _pallas_ready(), reason="Pallas kernel requires GPU availability")
+@pytest.mark.parametrize("chunk_size", [1, 4, 7])
+def test_pallas_kernel_matches_reference(chunk_size: int) -> None:
+    batch, intermediate, seq, state_size = 2, 4, 11, 3
+
+    key_hidden, key_delta, key_gate, key_B, key_C, key_a, key_d, key_state = jax.random.split(jax.random.PRNGKey(0), 8)
+    hidden = jax.random.normal(key_hidden, (batch, intermediate, seq))
+    delta = jax.random.normal(key_delta, (batch, intermediate, seq))
+    gate = jax.random.uniform(key_gate, (batch, intermediate, seq))
+    B = jax.random.normal(key_B, (batch, seq, state_size))
+    C = jax.random.normal(key_C, (batch, seq, state_size))
+
+    params = MambaKernelParams(
+        a_log=jax.random.normal(key_a, (intermediate, state_size)),
+        d=jax.random.normal(key_d, (intermediate,)),
+    )
+    inputs = MambaKernelInputs(hidden=hidden, delta=delta, B=B, C=C, gate=gate)
+    init_state = MambaKernelState(ssm=jax.random.normal(key_state, (batch, intermediate, state_size)))
+
+    ref_kernel = MambaReferenceKernel(mode=KernelMode.CHUNK, dtype=jnp.float32)
+    pallas_kernel = MambaPallasKernel(mode=KernelMode.CHUNK, dtype=jnp.float32)
+
+    ref_out, ref_state = ref_kernel.forward_chunk(params, inputs, init_state, chunk_size=chunk_size)
+    pal_out, pal_state = pallas_kernel.forward_chunk(params, inputs, init_state, chunk_size=chunk_size)
+
+    np.testing.assert_allclose(ref_out, pal_out, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(ref_state.ssm, pal_state.ssm, rtol=1e-4, atol=1e-4)
