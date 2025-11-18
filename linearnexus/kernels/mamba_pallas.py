@@ -21,6 +21,10 @@ PALLAS_AVAILABLE: bool = pl is not None
 Array = jax.Array
 
 
+def _next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
 def _mamba_pallas_kernel(
     hidden_ref,
     delta_ref,
@@ -99,13 +103,13 @@ class MambaPallasKernel(SelectiveKernelProtocol):
         batch_size, intermediate_size, seq_len = hidden.shape
         ssm_state_dim = params.a_log.shape[-1]
         chunk_size = max(1, chunk_size)
-        pad = (-(seq_len)) % chunk_size
+        chunk_pad = (-(seq_len)) % max(1, chunk_size)
 
-        hidden = self._pad_sequence(hidden, pad, axis=-1)
-        delta = self._pad_sequence(delta, pad, axis=-1)
-        gate = self._pad_sequence(gate, pad, axis=-1)
-        B = self._pad_sequence(B, pad, axis=1)
-        C = self._pad_sequence(C, pad, axis=1)
+        hidden = self._pad_sequence(hidden, chunk_pad, axis=-1)
+        delta = self._pad_sequence(delta, chunk_pad, axis=-1)
+        gate = self._pad_sequence(gate, chunk_pad, axis=-1)
+        B = self._pad_sequence(B, chunk_pad, axis=1)
+        C = self._pad_sequence(C, chunk_pad, axis=1)
 
         padded_len = hidden.shape[-1]
         if state is None:
@@ -114,6 +118,16 @@ class MambaPallasKernel(SelectiveKernelProtocol):
 
         if padded_len == 0:
             return hidden[:, :, :0], state
+
+        power_two_len = _next_power_of_two(padded_len)
+        extra_pad = power_two_len - padded_len
+        if extra_pad:
+            hidden = self._pad_sequence(hidden, extra_pad, axis=-1)
+            delta = self._pad_sequence(delta, extra_pad, axis=-1)
+            gate = self._pad_sequence(gate, extra_pad, axis=-1)
+            B = self._pad_sequence(B, extra_pad, axis=1)
+            C = self._pad_sequence(C, extra_pad, axis=1)
+            padded_len = power_two_len
 
         a = -jnp.exp(params.a_log.astype(self.dtype))
         d = params.d.astype(self.dtype)
