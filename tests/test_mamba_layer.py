@@ -37,14 +37,8 @@ def test_attention_mask_zeroes_out_tokens():
     assert_mask_behavior(layer, inputs, mask)
 
 
-@pytest.mark.skip(reason="Pallas backend disabled due to Triton limitations (Phase 0). Re-enable in Phase 1+ with handwritten Triton kernel.")
 @pytest.mark.skipif(not _pallas_ready(), reason="Pallas backend requires a GPU + jax.experimental.pallas")
 def test_pallas_backend_chunk_and_recurrent_paths_align():
-    """Test Pallas backend kernel integration.
-    
-    **CURRENTLY DISABLED**: MambaPallasKernel raises NotImplementedError due to
-    Triton/Pallas limitations. Sequential scan operations are not supported.
-    """
     rngs = nnx.Rngs(4)
     config = MambaConfig(
         hidden_size=32,
