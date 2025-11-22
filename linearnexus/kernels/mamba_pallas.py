@@ -69,8 +69,9 @@ def _mamba_pallas_kernel(
         deltaB_u = discrete_B * hidden_t    # [state_size]
         ssm_state = discrete_A * ssm_state + deltaB_u  # [state_size]
         
-        # Output projection
-        y = jnp.dot(ssm_state, C_t)         # scalar
+        # Output projection: Triton dot lowering requires >=16 elements,
+        # so manually accumulate the inner product for our small state.
+        y = jnp.sum(ssm_state * C_t)
         y = y + d_scalar * hidden_t         # scalar
         y = y * gate_t                      # scalar
         
