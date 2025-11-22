@@ -46,6 +46,11 @@ NUM_SUBLANES = 8       # Sub-vector granularity
 MIN_BLOCK_SIZE = 128   # Minimum efficient tile size
 ```
 
+> **Runtime requirement:** Pallas TPU kernels only lower when `libtpu` is up to date. Keep
+> the TPU runtime within ~30 days of the current release (upgrade your VM image or
+> install the latest `libtpu` wheel) or JAX will raise `RuntimeError: Pallas TPU requires
+> a libtpu version that's at most a month old` during lowering.
+
 **Critical**: All block sizes must be multiples of `NUM_LANES` (128) for efficient vectorization.
 
 ---

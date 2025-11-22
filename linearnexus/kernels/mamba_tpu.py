@@ -8,11 +8,13 @@ parallel training and autoregressive inference.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.lib import xla_bridge
 
 try:  # pragma: no cover - optional TPU-specific dependency
     from jax.experimental import pallas as pl
@@ -36,17 +38,50 @@ def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def _check_tpu_available() -> bool:
-    """Check if TPU devices are available in current JAX backend."""
+def _check_tpu_available() -> Tuple[bool, str]:
+    """Check TPU availability and ensure libtpu build is fresh enough."""
+
     if pl is None or pltpu is None:
-        return False
+        return False, "Pallas TPU backend not installed"
+
     try:
-        return any(device.platform == "tpu" for device in jax.devices())
-    except Exception:
-        return False
+        gpu_devices = jax.devices()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return False, f"Unable to query JAX devices: {exc}"
+
+    tpu_devices = [device for device in gpu_devices if device.platform == "tpu"]
+    if not tpu_devices:
+        return False, "No TPU devices detected"
+
+    # Check libtpu build freshness (Pallas TPU requires a recent runtime)
+    try:
+        backend = xla_bridge.get_backend("tpu")
+        platform_version = getattr(backend, "platform_version", "").strip()
+    except Exception as exc:  # pragma: no cover
+        return False, f"Unable to query TPU backend version: {exc}"
+
+    if platform_version:
+        match = re.search(r"Built on (\w{3}) (\d{1,2}) (\d{4})", platform_version)
+        if match:
+            month_str, day_str, year_str = match.groups()
+            try:
+                build_date = datetime.strptime(
+                    f"{month_str} {day_str} {year_str}", "%b %d %Y"
+                ).date()
+                now = datetime.now(timezone.utc).date()
+                if (now - build_date).days > 31:
+                    return (
+                        False,
+                        "TPU runtime is older than 31 days; upgrade libtpu ("
+                        f"build {build_date.isoformat()}).",
+                    )
+            except ValueError:  # pragma: no cover - unexpected format
+                pass
+
+    return True, ""
 
 
-TPU_AVAILABLE: bool = _check_tpu_available()
+TPU_AVAILABLE, TPU_AVAILABILITY_MESSAGE = _check_tpu_available()
 
 
 def _mamba_tpu_kernel(
@@ -142,8 +177,10 @@ class MambaTPUKernel(SelectiveKernelProtocol):
                 "jax.experimental.pallas and pallas.tpu are required for MambaTPUKernel"
             )
         if not TPU_AVAILABLE:
+            reason = TPU_AVAILABILITY_MESSAGE or "TPU backend unavailable"
             raise RuntimeError(
-                "MambaTPUKernel requires TPU devices. No TPU found in jax.devices()."
+                "MambaTPUKernel requires a TPU backend: "
+                f"{reason}"
             )
         self.mode = mode
         self.dtype = dtype

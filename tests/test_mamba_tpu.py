@@ -15,6 +15,7 @@ from linearnexus.kernels import (
     MambaReferenceKernel,
     MambaTPUKernel,
     TPU_AVAILABLE,
+    TPU_AVAILABILITY_MESSAGE,
 )
 
 
@@ -23,7 +24,11 @@ def _tpu_ready() -> bool:
     return TPU_AVAILABLE
 
 
-@pytest.mark.skipif(not _tpu_ready(), reason="TPU kernel requires TPU device availability")
+_TPU_SKIP_REASON = (
+    TPU_AVAILABILITY_MESSAGE or "TPU kernel requires TPU device availability"
+)
+
+@pytest.mark.skipif(not _tpu_ready(), reason=_TPU_SKIP_REASON)
 @pytest.mark.parametrize("chunk_size", [1, 4, 7])
 def test_tpu_kernel_matches_reference(chunk_size: int) -> None:
     """Test that TPU kernel produces identical outputs to reference kernel."""
@@ -58,7 +63,7 @@ def test_tpu_kernel_matches_reference(chunk_size: int) -> None:
     np.testing.assert_allclose(ref_state.ssm, tpu_state.ssm, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.skipif(not _tpu_ready(), reason="TPU kernel requires TPU device availability")
+@pytest.mark.skipif(not _tpu_ready(), reason=_TPU_SKIP_REASON)
 def test_tpu_kernel_zero_state() -> None:
     """Test TPU kernel with zero initial state."""
     batch, intermediate, seq, state_size = 1, 2, 8, 4
@@ -89,7 +94,7 @@ def test_tpu_kernel_zero_state() -> None:
     np.testing.assert_allclose(ref_state.ssm, tpu_state.ssm, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.skipif(not _tpu_ready(), reason="TPU kernel requires TPU device availability")
+@pytest.mark.skipif(not _tpu_ready(), reason=_TPU_SKIP_REASON)
 def test_tpu_kernel_recurrent_mode() -> None:
     """Test TPU kernel in recurrent mode (single token inference)."""
     batch, intermediate, state_size = 2, 4, 3
@@ -121,7 +126,7 @@ def test_tpu_kernel_recurrent_mode() -> None:
     np.testing.assert_allclose(ref_state.ssm, tpu_state.ssm, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.skipif(not _tpu_ready(), reason="TPU kernel requires TPU device availability")
+@pytest.mark.skipif(not _tpu_ready(), reason=_TPU_SKIP_REASON)
 def test_tpu_kernel_large_state() -> None:
     """Test TPU kernel with larger state dimension (tests padding logic)."""
     batch, intermediate, seq, state_size = 1, 2, 16, 64
@@ -152,7 +157,7 @@ def test_tpu_kernel_large_state() -> None:
     np.testing.assert_allclose(ref_state.ssm, tpu_state.ssm, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.skipif(not _tpu_ready(), reason="TPU kernel requires TPU device availability")
+@pytest.mark.skipif(not _tpu_ready(), reason=_TPU_SKIP_REASON)
 @pytest.mark.parametrize("seq_len", [7, 15, 128, 256])
 def test_tpu_kernel_various_seq_lengths(seq_len: int) -> None:
     """Test TPU kernel with various sequence lengths (tests padding alignment)."""
