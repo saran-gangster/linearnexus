@@ -79,7 +79,7 @@ class MambaPallasKernel(SelectiveKernelProtocol):
         self.mode = mode
         self.dtype = dtype
 
-    def _pad_sequence(self, tensor: Array, pad: int, axis: int = -1) -> Array:
+    def _pad_axis(self, tensor: Array, pad: int, axis: int = -1) -> Array:
         if pad == 0:
             return tensor
         pad_width = [(0, 0)] * tensor.ndim
@@ -105,31 +105,44 @@ class MambaPallasKernel(SelectiveKernelProtocol):
         chunk_size = max(1, chunk_size)
         chunk_pad = (-(seq_len)) % max(1, chunk_size)
 
-        hidden = self._pad_sequence(hidden, chunk_pad, axis=-1)
-        delta = self._pad_sequence(delta, chunk_pad, axis=-1)
-        gate = self._pad_sequence(gate, chunk_pad, axis=-1)
-        B = self._pad_sequence(B, chunk_pad, axis=1)
-        C = self._pad_sequence(C, chunk_pad, axis=1)
+        hidden = self._pad_axis(hidden, chunk_pad, axis=-1)
+        delta = self._pad_axis(delta, chunk_pad, axis=-1)
+        gate = self._pad_axis(gate, chunk_pad, axis=-1)
+        B = self._pad_axis(B, chunk_pad, axis=1)
+        C = self._pad_axis(C, chunk_pad, axis=1)
 
         padded_len = hidden.shape[-1]
+        power_two_state = _next_power_of_two(ssm_state_dim)
+        state_pad = power_two_state - ssm_state_dim
+
         if state is None:
-            state = MambaKernelState.zeros(batch_size, intermediate_size, ssm_state_dim, self.dtype)
-        ssm_state = state.ssm.astype(self.dtype)
+            ssm_state = jnp.zeros((batch_size, intermediate_size, power_two_state), dtype=self.dtype)
+        else:
+            ssm_state = state.ssm.astype(self.dtype)
+            if state_pad:
+                ssm_state = self._pad_axis(ssm_state, state_pad, axis=-1)
+
+        if state_pad:
+            B = self._pad_axis(B, state_pad, axis=2)
+            C = self._pad_axis(C, state_pad, axis=2)
 
         if padded_len == 0:
-            return hidden[:, :, :0], state
+            trimmed_state = state.ssm[:, :, :ssm_state_dim]
+            return hidden[:, :, :0], MambaKernelState(ssm=trimmed_state)
 
         power_two_len = _next_power_of_two(padded_len)
         extra_pad = power_two_len - padded_len
         if extra_pad:
-            hidden = self._pad_sequence(hidden, extra_pad, axis=-1)
-            delta = self._pad_sequence(delta, extra_pad, axis=-1)
-            gate = self._pad_sequence(gate, extra_pad, axis=-1)
-            B = self._pad_sequence(B, extra_pad, axis=1)
-            C = self._pad_sequence(C, extra_pad, axis=1)
+            hidden = self._pad_axis(hidden, extra_pad, axis=-1)
+            delta = self._pad_axis(delta, extra_pad, axis=-1)
+            gate = self._pad_axis(gate, extra_pad, axis=-1)
+            B = self._pad_axis(B, extra_pad, axis=1)
+            C = self._pad_axis(C, extra_pad, axis=1)
             padded_len = power_two_len
 
         a = -jnp.exp(params.a_log.astype(self.dtype))
+        if state_pad:
+            a = self._pad_axis(a, state_pad, axis=-1)
         d = params.d.astype(self.dtype)
 
         out_shape = (
@@ -144,7 +157,8 @@ class MambaPallasKernel(SelectiveKernelProtocol):
         )(hidden, delta, gate, B, C, a, d, ssm_state)
 
         outputs = outputs[:, :, :seq_len]
-        return outputs, MambaKernelState(ssm=final_state)
+        trimmed_state = final_state[:, :, :ssm_state_dim]
+        return outputs, MambaKernelState(ssm=trimmed_state)
 
     def forward_recurrent(
         self,

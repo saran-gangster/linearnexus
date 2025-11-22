@@ -268,6 +268,406 @@ def pipeline_with_callback(a_gmem, b_gmem, send_ref):
     )
 ```
 
+### FlashAttention3: Production Warp-Specialized Pipeline
+
+**Source**: JAX's Mosaic GPU FlashAttention3 (`jax/tests/pallas/mosaic_fa3_test.py`) - a complete implementation overlapping Tensor Core compute, TMA memory transfers, and online softmax with numerically stable log-sum-exp tracking.
+
+#### Architecture Overview
+
+```
+Grid: (num_q_heads, q_seq_len // (2*block_q), batch_size)
+Launch: 3 warpgroups per block
+  - WG 0-1: Compute warpgroups (process disjoint Q tile halves)
+  - WG 2:   Memory warpgroup (streams K/V via TMA)
+```
+
+**Key Innovation**: Each compute warpgroup processes `block_q` tokens independently (no inter-warp communication except schedule barrier), enabling perfect parallelism within a block while the memory warp asynchronously prefetches next KV tiles.
+
+#### Configuration & Constraints
+
+```python
+@dataclasses.dataclass(frozen=True)
+class TuningConfig:
+    block_q: int           # Query tile size (must be multiple of 64)
+    block_kv: int          # KV tile size (must be multiple of 64)
+    max_concurrent_steps: int  # Pipeline depth (≥2)
+    use_schedule_barrier: bool = True
+    causal: bool = False
+    compute_wgs_bwd: int = 1  # Backward-specific
+    
+    # Backward pass tiles (all-or-nothing)
+    block_q_dkv: int | None = None   # Q tiles for dK/dV kernel
+    block_kv_dkv: int | None = None  # KV tiles for dK/dV kernel
+    block_q_dq: int | None = None    # Q tiles for dQ kernel
+    block_kv_dq: int | None = None   # KV tiles for dQ kernel
+```
+
+**Validation Rules**:
+- `block_q % 64 == 0` and `block_kv % 64 == 0` (WGMMA alignment)
+- `head_dim % 64 == 0` (TensorCore row requirement)
+- `kv_seq_len % block_kv == 0` (no partial tiles)
+- `q_seq_len % (2 * block_q) == 0` (2 compute warpgroups per block)
+- Backward blocks: all four must be set or all must be None
+
+**CUDA Compatibility Bug**: Causal masking fails on CUDA 12.8.0-12.9.0 due to ptxas miscompilation. Check `cuda_runtime_get_version()` and skip.
+
+#### Memory Layout & SMEM Allocation
+
+```python
+# Forward pass scratch (per block)
+tiling = plgpu.TilingTransform((8, 64))  # 8 rows × 64 cols per tile
+swizzle = plgpu.SwizzleTransform(128)    # 128-byte swizzle for bank conflict reduction
+
+qo_scratch = plgpu.SMEM(
+    (2, block_q, head_dim), jnp.float16,  # 2 compute warpgroups
+    transforms=(tiling, swizzle)
+)
+k_scratch = plgpu.SMEM(
+    (max_concurrent_steps, block_kv, head_dim), jnp.float16,
+    transforms=(tiling, swizzle)
+)
+v_scratch = plgpu.SMEM(
+    (max_concurrent_steps, block_kv, head_dim), jnp.float16,
+    transforms=(tiling, swizzle)
+)
+lse_scratch = plgpu.SMEM((2, block_q), jnp.float32)  # Optional for backward
+```
+
+**Why Swizzle?** Without swizzling, consecutive rows map to the same SMEM banks → serialized access. Swizzle XORs high address bits with low bits, distributing rows across banks for parallel access.
+
+#### Warp Specialization Pattern
+
+```python
+def entry(q_ref, k_ref, v_ref, out_ref, lse_ref):
+    def kernel(q_ref, k_ref, v_ref, out_ref, lse_ref, scoped):
+        wg_idx = lax.axis_index("wg")  # 0, 1, or 2
+        
+        @pl.when(wg_idx < 2)  # Compute warpgroups
+        def _compute_wg():
+            plgpu.set_max_registers(232, action="increase")  # More regs for compute
+            # ... attention compute ...
+        
+        @pl.when(wg_idx == 2)  # Memory warpgroup
+        def _memory_wg():
+            plgpu.set_max_registers(40, action="decrease")  # Fewer regs for TMA
+            # ... TMA prefetch loop ...
+    
+    pl.run_scoped(kernel, scratch, barriers, ...)
+
+# Invoke with 3 threads
+plgpu.kernel(entry, num_threads=3, thread_name="wg", ...)(q, k, v)
+```
+
+**Register Budgeting**:
+- Compute WGs: 232 registers (need space for accumulators, softmax state)
+- Memory WG: 40 registers (only issues async copies, minimal live values)
+- Total: ~600 registers/block (under H100's 65K register file / 2K threads = ~32 regs/thread baseline, but block-level allocation allows imbalance)
+
+#### Pipeline Structure: `emit_pipeline_warp_specialized`
+
+```python
+def kv_loop(kv_step, carry, causal=False):
+    """Pipeline step: process one KV tile."""
+    acc, m_i, l_i = carry
+    slot = lax.rem(kv_step, max_concurrent_steps)  # Circular buffer
+    
+    # === QK Matmul (attention logits) ===
+    def compute_qk(acc_ref):
+        plgpu.wgmma(acc_ref, qo_smem, plgpu.transpose_ref(k_smem.at[slot], (1, 0)))
+        perform_schedule_barrier()  # Let other WG use TensorCore
+        return acc_ref[...]
+    
+    qk = pl.run_scoped(compute_qk, plgpu.ACC((block_q, block_kv), jnp.float32))
+    plgpu.barrier_arrive(k_consumed_barriers.at[slot])  # Release K buffer
+    
+    # === Causal Masking (if enabled) ===
+    if causal:
+        q_seq_base = lax.axis_index("q_seq") * (2 * block_q) + wg_idx * block_q
+        q_ids = plgpu.broadcasted_iota(jnp.int32, (block_q, block_kv), 0, layout=plgpu.Layout.WGMMA)
+        kv_ids = plgpu.broadcasted_iota(jnp.int32, (block_q, block_kv), 1, layout=plgpu.Layout.WGMMA)
+        mask = (q_ids + q_seq_base) >= (kv_ids + kv_step * block_kv)
+        qk = jnp.where(mask, qk, -jnp.inf)
+    
+    # === Online Softmax (FlashAttention algorithm) ===
+    log2e = math.log2(math.e)
+    m_ij = jnp.maximum(m_i, qk.max(axis=1) * log2e)  # Max in log2 space
+    alpha = jnp.exp2(m_i - m_ij)                     # Rescaling factor
+    m_i = m_ij                                       # Update running max
+    
+    # Compute softmax weights in log2 space (FMA-friendly)
+    p = jnp.exp2(qk * log2e - lax.broadcast_in_dim(m_ij, qk.shape, [0]))
+    
+    # Rescale previous accumulator
+    acc *= lax.broadcast_in_dim(alpha, acc.shape, [0])
+    l_i *= alpha
+    p16 = p.astype(dtype)
+    
+    # Ordering matters: barrier placement affects register allocation
+    if head_dim <= 128:
+        l_i += p.sum(axis=1)
+        acc, l_i, m_i, p16 = lax.optimization_barrier((acc, l_i, m_i, p16))
+        end_softmax_barriers()
+    else:
+        end_softmax_barriers()
+        l_i += p.sum(axis=1)
+    
+    # === PV Matmul (weighted sum of values) ===
+    def compute_pv(acc_ref):
+        plgpu.wgmma(acc_ref, p16, v_smem.at[slot])
+        
+        # Prefetch wait for next KV tile (hide latency)
+        wait_step = kv_step + 1
+        wait_slot = lax.rem(wait_step, max_concurrent_steps)
+        @pl.when(wait_step < kv_steps)
+        def _wait():
+            plgpu.barrier_wait(k_barriers.at[wait_slot])
+    
+    acc = pl.run_state(compute_pv)(plgpu.ACC.init(acc))
+    plgpu.barrier_arrive(v_consumed_barriers.at[slot])
+    
+    return acc, m_i, l_i
+```
+
+**Critical Insights**:
+
+1. **Base-2 Softmax**: Using `log2` instead of natural log lets us write `p = exp2(qk * log2e - m)`, which compiles to FMA (`a*b + c`) on GPUs. Natural log would require separate mul + exp.
+
+2. **Online Softmax State**: FlashAttention doesn't materialize full attention matrix. Instead, track running statistics:
+   - `m_i`: max logit seen so far (in log2 space)
+   - `l_i`: sum of exp-shifted logits
+   - `acc`: weighted sum of values (rescaled each iteration)
+   
+   Final output: `acc / l_i` (normalized attention output)
+
+3. **Optimization Barrier**: `lax.optimization_barrier()` prevents XLA from reordering ops. Empirically, certain orderings hurt performance (register spills or worse instruction scheduling). The `head_dim <= 128` branch uses different orderings for small vs large head dimensions.
+
+4. **Prefetch Next Tile**: While computing with `slot`, issue `barrier_wait` for `slot+1`. By the time current step finishes, next tile is ready (hides TMA latency).
+
+5. **Consumed Barriers**: Separate from load barriers. Memory WG waits on `*_consumed_barriers` before overwriting buffer, ensuring compute WG finished reading.
+
+#### Causal Attention: Three-Phase Loop
+
+Standard loop assumes all KV tiles are needed. Causal masking makes some tiles unnecessary (e.g., token 0 only attends to token 0, not future tokens).
+
+```python
+if config.causal:
+    q_seq_base = lax.axis_index("q_seq") * (2 * block_q) + wg_idx * block_q
+    block_q_end = q_seq_base + block_q
+    block_max_kv_steps = pl.cdiv(block_q_end, block_kv)  # Only need this many KV tiles
+    kv_steps = block_max_kv_steps
+else:
+    block_max_kv_steps = kv_seq_len // block_kv
+    kv_steps = block_max_kv_steps
+
+# Phase 1: Full tiles (no masking needed)
+full_kv_steps = lax.div(q_seq_base, block_kv)
+acc, m_i, l_i = lax.fori_loop(0, full_kv_steps, kv_loop, (acc, m_i, l_i))
+
+# Phase 2: Causal tiles (apply mask)
+causal_kv_loop = functools.partial(kv_loop, causal=True)
+acc, m_i, l_i = lax.fori_loop(full_kv_steps, kv_steps, causal_kv_loop, (acc, m_i, l_i))
+
+# Phase 3: Epilogue (flush pipeline)
+def epilogue_kv_loop(kv_step, _):
+    slot = lax.rem(kv_step, max_concurrent_steps)
+    plgpu.barrier_arrive(k_consumed_barriers.at[slot])
+    plgpu.barrier_arrive(v_consumed_barriers.at[slot])
+    perform_schedule_barrier()
+    perform_schedule_barrier()
+
+lax.fori_loop(kv_steps, block_max_kv_steps, epilogue_kv_loop, None)
+```
+
+**Why Epilogue?** Memory WG prefetched `max_concurrent_steps` tiles upfront. If compute finishes early (causal masking), some prefetched tiles are unused. Epilogue signals all barriers to unblock memory WG, preventing deadlock.
+
+#### Memory Warpgroup: TMA Streaming
+
+```python
+@pl.when(wg_idx == 2)
+def _memory_wg():
+    plgpu.set_max_registers(40, action="decrease")
+    kv_head = lax.div(q_head, q_heads_per_kv_head)  # GQA: fewer KV heads
+    
+    # Prologue: fill pipeline
+    for i in range(max_concurrent_steps):
+        s = (batch, pl.ds(i * block_kv, block_kv), kv_head)
+        plgpu.copy_gmem_to_smem(k_ref.at[s], k_smem.at[i], k_barriers.at[i])
+        plgpu.copy_gmem_to_smem(v_ref.at[s], v_smem.at[i], v_barriers.at[i])
+    
+    # Main loop: double-buffer remaining tiles
+    @pl.loop(0, block_max_kv_steps - max_concurrent_steps)
+    def _kv_loop(kv_step):
+        tma_step = kv_step + max_concurrent_steps
+        tma_slot = lax.rem(kv_step, max_concurrent_steps)
+        s = (batch, pl.ds(tma_step * block_kv, block_kv), kv_head)
+        
+        # Wait for compute to finish with this slot
+        plgpu.barrier_wait(k_consumed_barriers.at[tma_slot])
+        plgpu.copy_gmem_to_smem(k_ref.at[s], k_smem.at[tma_slot], k_barriers.at[tma_slot])
+        
+        plgpu.barrier_wait(v_consumed_barriers.at[tma_slot])
+        plgpu.copy_gmem_to_smem(v_ref.at[s], v_smem.at[tma_slot], v_barriers.at[tma_slot])
+```
+
+**TMA (Tensor Memory Accelerator)**: Hardware unit for async GMEM→SMEM transfers. Advantages:
+- Zero CPU cycles after launch (fully async)
+- Automatic 2D/3D tiling and swizzling
+- Multicast to multiple SMEM banks across thread blocks (cluster support)
+
+**Barrier Protocol**:
+1. Memory WG: `copy_gmem_to_smem(..., load_barrier.at[slot])` → signals when data arrives
+2. Compute WG: `barrier_wait(load_barrier.at[slot])` → waits for data
+3. Compute WG: `barrier_arrive(consumed_barrier.at[slot])` → signals done reading
+4. Memory WG: `barrier_wait(consumed_barrier.at[slot])` → safe to overwrite
+
+#### Backward Pass: Dual Pipelines
+
+Backward requires computing three gradients: `dQ`, `dK`, `dV`. FlashAttention3 splits into two kernels:
+
+**Kernel 1: Compute dQ**
+- Pipeline over **KV tiles** (like forward)
+- Preload per-query scalars: `lse` (log-sum-exp from forward), `delta = sum(dO * O)`
+- Inner loop: `dS = P * (dP - delta)` → `dQ += dS @ K`
+
+```python
+def kernel_dq(q_ref, k_ref, v_ref, do_ref, lse_ref, delta_ref, dq_ref, ...):
+    # Load Q, dO, lse, delta into SMEM
+    delta = plgpu.load(delta_smem, (), layout=plgpu.Layout.WGMMA_ROW)
+    lse = plgpu.load(lse_smem, (), layout=plgpu.Layout.WGMMA_ROW)
+    
+    def kv_step(_, k_smem, v_smem, k_consumed, v_consumed, carry):
+        dq_acc, lse, delta = carry
+        
+        # S = Q @ K.T
+        s = pl.run_scoped(lambda a: plgpu.wgmma(a, q_smem, k_smem.T), plgpu.ACC(...))
+        s *= math.log2(math.e)
+        p = jnp.exp2(s - lax.broadcast_in_dim(lse, s.shape, [0]))
+        
+        # dP = dO @ V.T
+        dp = pl.run_scoped(lambda a: plgpu.wgmma(a, do_smem, v_smem.T), plgpu.ACC(...))
+        plgpu.barrier_arrive(v_consumed)
+        
+        # dS = P * (dP - delta)
+        ds = p * (dp - lax.broadcast_in_dim(delta, p.shape, [0]))
+        
+        # dQ += dS @ K
+        dq_acc = pl.run_state(lambda a: plgpu.wgmma(a, ds.astype(dtype), k_smem))(plgpu.ACC.init(dq_acc))
+        plgpu.barrier_arrive(k_consumed)
+        
+        return dq_acc, lse, delta
+    
+    pipeline = plgpu.emit_pipeline_warp_specialized(kv_step, grid=(num_kv_tiles,), ...)
+```
+
+**Kernel 2: Compute dK, dV**
+- Pipeline over **query tiles** (transpose of forward)
+- Each KV tile accumulates gradients from all query tiles that attended to it
+- Inner loop: `dV += P.T @ dO`, `dK += dS.T @ Q`
+
+```python
+def kernel_dkv(q_ref, k_ref, v_ref, do_ref, lse_ref, delta_ref, dk_ref, dv_ref, ...):
+    # Load K, V into SMEM (fixed for this output tile)
+    dk_acc = jnp.zeros((block_kv, head_dim), jnp.float32)
+    dv_acc = jnp.zeros((block_kv, head_dim), jnp.float32)
+    
+    def q_step(_, q_smem, do_smem, lse_smem, delta_smem, ..., carry):
+        dk_acc, dv_acc = carry
+        
+        # S.T = K @ Q.T
+        sT = pl.run_scoped(lambda a: plgpu.wgmma(a, k_smem, q_smem.T), plgpu.ACC(...))
+        lse = plgpu.load(lse_smem, (), layout=plgpu.Layout.WGMMA_COL)  # Column layout!
+        pT = jnp.exp2(sT * log2e - lax.broadcast_in_dim(lse, sT.shape, [1]))
+        
+        # dV += P.T @ dO, dpT = V @ dO.T (fused)
+        def compute_dv_dpt(refs):
+            dv_acc_ref, dpt_acc_ref = refs
+            plgpu.wgmma(dv_acc_ref, pT.astype(dtype), do_smem)
+            plgpu.wgmma(dpt_acc_ref, v_smem, do_smem.T)
+        
+        dv_acc, dpT = pl.run_state(compute_dv_dpt)((plgpu.ACC.init(dv_acc), plgpu.ACC.init(zeros)))
+        
+        # dS.T = P.T * (dpT - delta)
+        delta = plgpu.load(delta_smem, (), layout=plgpu.Layout.WGMMA_COL)
+        dsT = pT * (dpT - lax.broadcast_in_dim(delta, pT.shape, [1]))
+        
+        # dK += dS.T @ Q
+        dk_acc = pl.run_state(lambda a: plgpu.wgmma(a, dsT.astype(dtype), q_smem))(plgpu.ACC.init(dk_acc))
+        
+        return dk_acc, dv_acc
+    
+    pipeline = plgpu.emit_pipeline_warp_specialized(q_step, grid=(num_q_tiles,), ...)
+```
+
+**Key Differences**:
+- `lse`/`delta` use `Layout.WGMMA_COL` in dK/dV kernel (transposed attention)
+- Fused WGMMA calls (`compute_dv_dpt`) avoid intermediate `barrier_wait`
+- GQA: `dk`/`dv` summed across query heads: `dk.reshape(..., q_heads_per_kv_head, head_dim).sum(axis=-2)`
+
+#### Performance Characteristics
+
+**Forward Pass (H100, batch=1, seq=4096, heads=16, dim=128)**:
+```
+block_q=64, block_kv=256: 180us = 85% TensorCore utilization
+block_q=64, block_kv=128: 165us = 92% TensorCore utilization
+block_q=64, block_kv=64:  155us = 98% TensorCore utilization
+```
+
+**Why smaller block_kv wins?**
+- Smaller tiles → less SMEM → higher occupancy → more warps in flight
+- At seq=4096, enough parallelism even with block_kv=64
+- Diminishing returns below 64 (WGMMA granularity)
+
+**Tuning Recommendations**:
+- Start with `block_q=64`, `block_kv=128`, `max_concurrent_steps=2`
+- If SMEM limited: reduce `max_concurrent_steps` or `block_kv`
+- If compute-bound (large head_dim): increase tile sizes
+- Causal: may need smaller tiles (less work per block)
+
+#### Applying to Linear Attention / SSMs
+
+**Shared patterns**:
+1. **Online aggregation**: FlashAttention's online softmax ≈ Mamba's chunk-wise recurrence
+2. **Warp specialization**: Separate memory/compute threads applicable to any pipelined kernel
+3. **Schedule barriers**: Critical when multiple warps share TensorCore (SSM conv + state update)
+4. **Base-2 math**: Use `exp2` for discretization (`exp(Δ*A)`) to enable FMA fusion
+
+**Differences**:
+- SSMs: State updates are **sequential** across chunks (need inter-chunk barriers)
+- Linear attention: May lack KV reuse (each query attends to all keys once)
+- Mamba: Additional depthwise conv (1D, can pipeline with chunk processing)
+
+**Template for Mamba chunk kernel**:
+```python
+def mamba_chunk_kernel(x_ref, conv_state_ref, ssm_state_ref, out_ref, ...):
+    wg_idx = lax.axis_index("wg")
+    
+    @pl.when(wg_idx == 0)  # Compute warpgroup
+    def _compute():
+        # Pipeline over chunks
+        def chunk_step(ci, x_chunk_smem, carry):
+            conv_out, ssm_state = carry
+            
+            # Depthwise conv (reuse previous chunk's suffix)
+            conv_out = depthwise_conv_causal(x_chunk_smem, conv_state)
+            
+            # Discretize & update SSM state
+            delta = ... # Input-dependent
+            a_discrete = jnp.exp2(a_log * delta * log2e)  # Base-2!
+            b_discrete = delta * b
+            
+            # Parallel scan within chunk (or sequential for simplicity)
+            ssm_state = ssm_state * a_discrete + conv_out * b_discrete
+            
+            return conv_out, ssm_state
+        
+        pipeline = plgpu.emit_pipeline_warp_specialized(chunk_step, ...)
+    
+    @pl.when(wg_idx == 1)  # Memory warpgroup
+    def _memory():
+        # Stream input chunks from GMEM
+        ...
+```
+
 ---
 
 ## Synchronization Patterns
@@ -348,6 +748,32 @@ def cluster_sync_pattern(acc_tmem, data_smem, cluster_barrier):
     
     # Now safe to reuse acc_tmem for next MMA
 ```
+
+### Schedule Barrier for Shared TensorCore Access
+
+FlashAttention3 uses an explicit "schedule" barrier (single-slot `plgpu.Barrier`) to serialize warpgroups that share the same Tensor Core pipelines:
+
+```python
+schedule_barrier = plgpu.Barrier(num_arrivals=num_compute_wgs)
+
+def perform_schedule_barrier():
+    plgpu.barrier_arrive(schedule_barrier)
+    plgpu.barrier_wait(schedule_barrier)
+
+@pl.when(wg_idx == 0)
+def compute_a():
+    perform_schedule_barrier()  # let wg 1 finish previous WGMMA
+    plgpu.wgmma(acc, q_smem, k_smem)
+
+@pl.when(wg_idx == 1)
+def compute_b():
+    perform_schedule_barrier()
+    plgpu.wgmma(acc, p_smem, v_smem)
+```
+
+- Arrive/wait pairs are invoked before and after every Tensor Core call so only one warp issues WGMMA at a time.
+- Because the barrier is separate from the per-buffer barriers, Tensor Core serialization stays orthogonal to buffer lifetime management.
+- This pattern drops register pressure (each warp runs a simpler loop) and improves determinism when profiling or autotuning.
 
 ---
 
