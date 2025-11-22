@@ -37,45 +37,48 @@ def _mamba_pallas_kernel(
     out_ref,
     state_out_ref,
 ):
-    """Single-program selective scan executed over one (batch, channel) pair."""
+    """Single-program selective scan executed over one (batch, channel) pair.
+    
+    Uses manual unrolled loop to avoid dynamic_slice - each program processes
+    the entire sequence for one (batch, channel) pair.
+    """
 
     batch_idx = pl.program_id(axis=0)
     channel_idx = pl.program_id(axis=1)
 
-    hidden = hidden_ref[batch_idx, channel_idx, :]
-    delta = delta_ref[batch_idx, channel_idx, :]
-    gate = gate_ref[batch_idx, channel_idx, :]
-    state = state_ref[batch_idx, channel_idx, :]
-    B = B_ref[batch_idx, :, :]
-    C = C_ref[batch_idx, :, :]
-    a = a_ref[channel_idx, :]
-    d = d_ref[channel_idx]
-
-    seq_len = hidden.shape[0]
-    outputs = jnp.zeros(seq_len, dtype=hidden.dtype)
-
-    def step(t, carry):
-        """Single timestep using fori_loop (Triton-compatible)."""
-        ssm_state, outputs = carry
-        hidden_t = hidden[t]
-        delta_t = delta[t]
-        gate_t = gate[t]
-        B_t = B[t, :]
-        C_t = C[t, :]
-        discrete_A = jnp.exp(a * delta_t)
-        discrete_B = delta_t * B_t
-        deltaB_u = discrete_B * hidden_t
-        ssm_state = discrete_A * ssm_state + deltaB_u
-        y = jnp.dot(ssm_state, C_t)
-        y = y + d * hidden_t
-        y = y * gate_t
-        outputs = outputs.at[t].set(y)
-        return (ssm_state, outputs)
-
-    final_state, outputs = jax.lax.fori_loop(0, seq_len, step, (state, outputs))
-
-    out_ref[batch_idx, channel_idx, :] = outputs
-    state_out_ref[batch_idx, channel_idx, :] = final_state
+    # Load sequence-level data (refs allow direct loads without dynamic_slice issues)
+    seq_len = hidden_ref.shape[2]
+    
+    # Load initial state and parameters (these are constant per-program)
+    ssm_state = state_ref[batch_idx, channel_idx, :]  # [state_size]
+    a = a_ref[channel_idx, :]                          # [state_size]
+    d_scalar = d_ref[channel_idx]                      # scalar
+    
+    # Manual loop over sequence (unrolled at compile time for small seq_len)
+    for t in range(seq_len):
+        # Load timestep inputs directly from refs
+        hidden_t = hidden_ref[batch_idx, channel_idx, t]
+        delta_t = delta_ref[batch_idx, channel_idx, t]
+        gate_t = gate_ref[batch_idx, channel_idx, t]
+        B_t = B_ref[batch_idx, t, :]        # [state_size]
+        C_t = C_ref[batch_idx, t, :]        # [state_size]
+        
+        # Selective scan step
+        discrete_A = jnp.exp(a * delta_t)   # [state_size]
+        discrete_B = delta_t * B_t          # [state_size]
+        deltaB_u = discrete_B * hidden_t    # [state_size]
+        ssm_state = discrete_A * ssm_state + deltaB_u  # [state_size]
+        
+        # Output projection
+        y = jnp.dot(ssm_state, C_t)         # scalar
+        y = y + d_scalar * hidden_t         # scalar
+        y = y * gate_t                      # scalar
+        
+        # Write output directly to ref
+        out_ref[batch_idx, channel_idx, t] = y
+    
+    # Write final state
+    state_out_ref[batch_idx, channel_idx, :] = ssm_state
 
 
 class MambaPallasKernel(SelectiveKernelProtocol):
