@@ -51,9 +51,17 @@ def _mamba_pallas_kernel(
     a = a_ref[channel_idx, :]
     d = d_ref[channel_idx]
 
-    def step(carry: Array, inputs: Tuple[Array, Array, Array, Array, Array]):
-        ssm_state = carry
-        hidden_t, delta_t, gate_t, B_t, C_t = inputs
+    seq_len = hidden.shape[0]
+    outputs = jnp.zeros(seq_len, dtype=hidden.dtype)
+
+    def step(t, carry):
+        """Single timestep using fori_loop (Triton-compatible)."""
+        ssm_state, outputs = carry
+        hidden_t = hidden[t]
+        delta_t = delta[t]
+        gate_t = gate[t]
+        B_t = B[t, :]
+        C_t = C[t, :]
         discrete_A = jnp.exp(a * delta_t)
         discrete_B = delta_t * B_t
         deltaB_u = discrete_B * hidden_t
@@ -61,10 +69,10 @@ def _mamba_pallas_kernel(
         y = jnp.dot(ssm_state, C_t)
         y = y + d * hidden_t
         y = y * gate_t
-        return ssm_state, y
+        outputs = outputs.at[t].set(y)
+        return (ssm_state, outputs)
 
-    scan_inputs = (hidden, delta, gate, B, C)
-    final_state, outputs = jax.lax.scan(step, state, scan_inputs)
+    final_state, outputs = jax.lax.fori_loop(0, seq_len, step, (state, outputs))
 
     out_ref[batch_idx, channel_idx, :] = outputs
     state_out_ref[batch_idx, channel_idx, :] = final_state
