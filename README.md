@@ -95,10 +95,13 @@ Scripts/configs are stubbed until kernels land; keep an eye on Issues for progre
 
 ### NNx Mamba Layer
 
-Wave 1 now includes a paper-faithful, CPU-friendly selective SSM implementation powered by Flax NNx **plus** an optional GPU-accelerated backend:
+Wave 1 now includes a paper-faithful, CPU-friendly selective SSM implementation powered by Flax NNx **plus** optional hardware-accelerated backends:
 
-- `linearnexus/layers/mamba.py` wires projections + caching to either the reference selective scan kernel (`linearnexus/kernels/mamba_reference.py`) or the new Pallas kernel (`linearnexus/kernels/mamba_pallas.py`).
-- Pick a backend via `MambaConfig.kernel_backend` (`"reference"`, `"pallas"`, or `"auto"`; the last one picks Pallas when a GPU + Pallas are available).
+- `linearnexus/layers/mamba.py` wires projections + caching to one of three kernel backends:
+  - **Reference** (`linearnexus/kernels/mamba_reference.py`): Pure JAX implementation for CPU/debugging
+  - **Pallas GPU** (`linearnexus/kernels/mamba_pallas.py`): Triton-backed kernel for Ampere+ GPUs (sm_80+)
+  - **Pallas TPU** (`linearnexus/kernels/mamba_tpu.py`): Mosaic backend for TPU v5e with VMEM optimization
+- Pick a backend via `MambaConfig.kernel_backend` (`"reference"`, `"pallas"`, `"tpu"`, or `"auto"`; the last one automatically selects the best available accelerator).
 - `tests/test_mamba_layer.py` keeps the chunked and recurrent paths numerically aligned for both backends, while `tests/test_mamba_kernels.py` cross-checks the Pallas and reference kernels directly.
 - `examples/run_mamba_reference.py` remains a tiny smoke test; pass `--kernel-backend pallas` once you have GPU support configured.
 

@@ -17,7 +17,7 @@ from linearnexus.kernels import (
 
 
 def _pallas_ready() -> bool:
-    return PALLAS_AVAILABLE and any(device.platform == "gpu" for device in jax.devices())
+    return PALLAS_AVAILABLE
 
 
 @pytest.mark.skipif(not _pallas_ready(), reason="Pallas kernel requires GPU availability")

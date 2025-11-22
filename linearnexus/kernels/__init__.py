@@ -8,6 +8,7 @@ from .mamba_reference import (
     MambaReferenceKernel,
 )
 from .mamba_pallas import MambaPallasKernel, PALLAS_AVAILABLE
+from .mamba_tpu import MambaTPUKernel, TPU_AVAILABLE
 
 __all__ = [
     "GridConfig",
@@ -19,4 +20,6 @@ __all__ = [
     "MambaReferenceKernel",
     "MambaPallasKernel",
     "PALLAS_AVAILABLE",
+    "MambaTPUKernel",
+    "TPU_AVAILABLE",
 ]

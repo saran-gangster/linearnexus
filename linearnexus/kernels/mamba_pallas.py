@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
+import re
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +16,48 @@ except ImportError:  # pragma: no cover - surfaced when Pallas is unavailable
 from .base import GridConfig, KernelMode, SelectiveKernelProtocol
 from .mamba_reference import MambaKernelInputs, MambaKernelParams, MambaKernelState
 
-PALLAS_AVAILABLE: bool = pl is not None
+PALLAS_MIN_COMPUTE_CAPABILITY = 80  # Ampere (sm_80) is required by Triton-backed Pallas
+
+
+def _device_compute_capability(device) -> Optional[int]:
+    """Extract the GPU compute capability (major*10 + minor) if available."""
+
+    version = getattr(device, "platform_version", "")
+    match = re.search(r"sm[_-]?(\d{2})", version.lower())
+    if match:
+        return int(match.group(1))
+
+    match = re.search(r"compute capability\s*(\d)\.(\d)", version.lower())
+    if match:
+        major = int(match.group(1))
+        minor = int(match.group(2))
+        return major * 10 + minor
+
+    return None
+
+
+def _triton_supported_on_current_hardware() -> bool:
+    """Return True if an Ampere-or-newer GPU is visible to JAX."""
+
+    if pl is None:
+        return False
+
+    gpu_devices = [device for device in jax.devices() if device.platform == "gpu"]
+    if not gpu_devices:
+        return False
+
+    for device in gpu_devices:
+        capability = _device_compute_capability(device)
+        if capability is None:
+            # Assume support if capability string is unavailable to avoid false negatives.
+            return True
+        if capability >= PALLAS_MIN_COMPUTE_CAPABILITY:
+            return True
+
+    return False
+
+
+PALLAS_AVAILABLE: bool = _triton_supported_on_current_hardware()
 
 Array = jax.Array
 
@@ -88,6 +129,10 @@ class MambaPallasKernel(SelectiveKernelProtocol):
     def __init__(self, *, mode: KernelMode = KernelMode.CHUNK, dtype: jnp.dtype = jnp.float32):
         if pl is None:
             raise ImportError("jax.experimental.pallas is required to instantiate MambaPallasKernel")
+        if not PALLAS_AVAILABLE:
+            raise RuntimeError(
+                "MambaPallasKernel requires an Ampere-or-newer GPU (compute capability >= 8.0) to run Triton-backed kernels."
+            )
         self.mode = mode
         self.dtype = dtype
 

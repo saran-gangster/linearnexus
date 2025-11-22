@@ -840,8 +840,13 @@ LAYER_REGISTRY = {
 ## Profiling Commands
 
 ```bash
-# JAX profiling with Pallas kernels
+# JAX profiling with Pallas GPU kernels
 JAX_PLATFORMS=gpu python -m jax.profiler trace \
+    --output_dir=/tmp/jax-profile \
+    examples/run_mamba_reference.py
+
+# JAX profiling with Pallas TPU kernels
+JAX_PLATFORMS=tpu python -m jax.profiler trace \
     --output_dir=/tmp/jax-profile \
     examples/run_mamba_reference.py
 

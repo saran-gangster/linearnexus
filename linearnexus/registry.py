@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Dict, Tuple, Type
 
-from linearnexus.kernels import MambaPallasKernel, MambaReferenceKernel, SelectiveKernelProtocol
+from linearnexus.kernels import (
+    MambaPallasKernel,
+    MambaReferenceKernel,
+    MambaTPUKernel,
+    SelectiveKernelProtocol,
+)
 from linearnexus.layers.mamba import MambaConfig, MambaLayer
 
 KernelCls = Type[SelectiveKernelProtocol]
@@ -13,6 +18,7 @@ LayerEntry = Tuple[Type[MambaLayer], Type[MambaConfig]]
 KERNEL_REGISTRY: Dict[str, KernelCls] = {
     "mamba:reference": MambaReferenceKernel,
     "mamba:pallas": MambaPallasKernel,
+    "mamba:tpu": MambaTPUKernel,
 }
 
 LAYER_REGISTRY: Dict[str, LayerEntry] = {
