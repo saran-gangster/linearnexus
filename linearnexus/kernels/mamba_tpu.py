@@ -259,18 +259,18 @@ class MambaTPUKernel(SelectiveKernelProtocol):
                 num_scalar_prefetch=0,  # No metadata to prefetch
                 grid=(batch_size, intermediate_size),
                 in_specs=[
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, padded_len)),  # hidden
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, padded_len)),  # delta
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, padded_len)),  # gate
-                    pl.BlockSpec(lambda b, c: (b, 0, 0), (1, padded_len, power_two_state)),  # B
-                    pl.BlockSpec(lambda b, c: (b, 0, 0), (1, padded_len, power_two_state)),  # C
-                    pl.BlockSpec(lambda b, c: (c, 0), (1, power_two_state)),   # a
-                    pl.BlockSpec(lambda b, c: (c,), (1,)),                      # d
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, power_two_state)),  # state_in
+                    pl.BlockSpec((1, 1, padded_len), lambda b, c: (b, c, 0)),  # hidden
+                    pl.BlockSpec((1, 1, padded_len), lambda b, c: (b, c, 0)),  # delta
+                    pl.BlockSpec((1, 1, padded_len), lambda b, c: (b, c, 0)),  # gate
+                    pl.BlockSpec((1, padded_len, power_two_state), lambda b, c: (b, 0, 0)),  # B
+                    pl.BlockSpec((1, padded_len, power_two_state), lambda b, c: (b, 0, 0)),  # C
+                    pl.BlockSpec((1, power_two_state), lambda b, c: (c, 0)),   # a
+                    pl.BlockSpec((1,), lambda b, c: (c,)),                     # d
+                    pl.BlockSpec((1, 1, power_two_state), lambda b, c: (b, c, 0)),  # state_in
                 ],
                 out_specs=[
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, padded_len)),  # out
-                    pl.BlockSpec(lambda b, c: (b, c, 0), (1, 1, power_two_state)),  # state_out
+                    pl.BlockSpec((1, 1, padded_len), lambda b, c: (b, c, 0)),  # out
+                    pl.BlockSpec((1, 1, power_two_state), lambda b, c: (b, c, 0)),  # state_out
                 ],
                 scratch_shapes=scratch_shapes,
             ),
