@@ -95,18 +95,19 @@ Scripts/configs are stubbed until kernels land; keep an eye on Issues for progre
 
 ### NNx Mamba Layer
 
-Wave 1 now includes a paper-faithful, CPU-friendly selective SSM implementation powered by Flax NNx **plus** an optional GPU-accelerated backend:
+Wave 1 now includes a paper-faithful, CPU-friendly selective SSM implementation powered by Flax NNx:
 
-- `linearnexus/layers/mamba.py` wires projections + caching to either the reference selective scan kernel (`linearnexus/kernels/mamba_reference.py`) or the new Pallas kernel (`linearnexus/kernels/mamba_pallas.py`).
-- Pick a backend via `MambaConfig.kernel_backend` (`"reference"`, `"pallas"`, or `"auto"`; the last one picks Pallas when a GPU + Pallas are available).
-- `tests/test_mamba_layer.py` keeps the chunked and recurrent paths numerically aligned for both backends, while `tests/test_mamba_kernels.py` cross-checks the Pallas and reference kernels directly.
-- `examples/run_mamba_reference.py` remains a tiny smoke test; pass `--kernel-backend pallas` once you have GPU support configured.
+- `linearnexus/layers/mamba.py` wires projections + caching to the reference selective scan kernel (`linearnexus/kernels/mamba_reference.py`).
+- **Pallas GPU backend status**: `linearnexus/kernels/mamba_pallas.py` exists but is **currently disabled** (Phase 0 constraint). Triton/Pallas does not support `dynamic_slice` or sequential `lax.scan` operations required for Mamba's selective scan. Phase 1+ will implement a handwritten Triton kernel bypassing the Pallas abstraction.
+- Pick a backend via `MambaConfig.kernel_backend` (`"reference"` [default], `"pallas"` [raises NotImplementedError], or `"auto"`).
+- `tests/test_mamba_layer.py` keeps the chunked and recurrent paths numerically aligned, while `tests/test_mamba_kernels.py` (currently disabled) will test GPU parity in Phase 1+.
+- `examples/run_mamba_reference.py` remains a tiny smoke test using the reference kernel.
 
-Try it locally once dependencies are installed (GPU optional for the final command):
+Try it locally once dependencies are installed:
 
 ```bash
-pytest tests/test_mamba_layer.py
-pytest tests/test_mamba_kernels.py  # requires GPU + Pallas runtime
+pytest tests/test_mamba_layer.py                   # CPU tests pass
+# pytest tests/test_mamba_kernels.py               # Disabled (Pallas unsupported in Phase 0)
 python examples/run_mamba_reference.py --batch 2 --seq 16 --hidden 64
 ```
 
