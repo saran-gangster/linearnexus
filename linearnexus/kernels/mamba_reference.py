@@ -1,4 +1,8 @@
-"""Reference selective scan kernel for Mamba-style layers."""
+"""Reference selective scan kernel for Mamba-style layers.
+
+This is a pure JAX implementation used as a correctness reference.
+It provides both chunk-based (training) and recurrent (inference) modes.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +13,17 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 
-from .base import GridConfig, KernelMode, SelectiveKernelProtocol
+from ..core.mode import KernelMode
 
 
 @dataclass
 class MambaKernelParams:
-    """Kernel parameters derived from the layer weights."""
+    """Kernel parameters derived from the layer weights.
+    
+    Attributes:
+        a_log: Log of the diagonal state matrix, shape [intermediate, ssm_state].
+        d: Skip connection weights, shape [intermediate].
+    """
 
     a_log: jax.Array  # [intermediate, ssm_state]
     d: jax.Array  # [intermediate]
@@ -22,7 +31,15 @@ class MambaKernelParams:
 
 @dataclass
 class MambaKernelInputs:
-    """Inputs required by the selective scan kernel."""
+    """Inputs required by the selective scan kernel.
+    
+    Attributes:
+        hidden: Input after in-projection, shape [batch, intermediate, seq].
+        delta: Time step parameter, shape [batch, intermediate, seq].
+        B: Input-dependent B matrix, shape [batch, seq, ssm_state].
+        C: Input-dependent C matrix, shape [batch, seq, ssm_state].
+        gate: Gating values, shape [batch, intermediate, seq].
+    """
 
     hidden: jax.Array  # [batch, intermediate, seq]
     delta: jax.Array  # [batch, intermediate, seq]
@@ -33,19 +50,33 @@ class MambaKernelInputs:
 
 @dataclass
 class MambaKernelState:
-    """State carried between invocations for recurrent decoding."""
+    """State carried between invocations for recurrent decoding.
+    
+    Attributes:
+        ssm: The SSM hidden state, shape [batch, intermediate, ssm_state].
+    """
 
     ssm: jax.Array  # [batch, intermediate, ssm_state]
 
     @classmethod
     def zeros(cls, batch_size: int, intermediate: int, ssm_state: int, dtype: jnp.dtype) -> "MambaKernelState":
+        """Create zero-initialized state."""
         return cls(
             ssm=jnp.zeros((batch_size, intermediate, ssm_state), dtype=dtype),
         )
 
 
-class MambaReferenceKernel(SelectiveKernelProtocol):
-    """Pure JAX selective scan kernel used as a correctness reference."""
+class MambaReferenceKernel:
+    """Pure JAX selective scan kernel used as a correctness reference.
+    
+    This kernel implements the selective scan algorithm from the Mamba paper
+    using standard JAX operations (lax.scan). It supports both chunk-based
+    processing for parallel training and token-by-token recurrent inference.
+    
+    Args:
+        mode: Default processing mode (CHUNK or RECURRENT).
+        dtype: Computation dtype (default: float32).
+    """
 
     def __init__(self, *, mode: KernelMode = KernelMode.CHUNK, dtype: jnp.dtype = jnp.float32):
         self.mode = mode
@@ -166,13 +197,3 @@ class MambaReferenceKernel(SelectiveKernelProtocol):
             chunk_size=1,
         )
         return outputs, new_state
-
-    def get_grid_config(
-        self,
-        *,
-        batch_size: int,
-        seq_len: int,
-        feature_dim: int,
-    ) -> GridConfig:
-        chunks = max(1, seq_len // 64)
-        return GridConfig(block_shape=(feature_dim,), num_programs=(batch_size * chunks,))

@@ -4,7 +4,7 @@ from .cache import ConvState, RecurrentState
 from .config import ConfigBase
 from .conv import depthwise_conv1d_causal
 from .gating import low_rank_project, normalize_gate_logits
-from .mode import select_mode
+from .mode import select_mode, KernelMode
 from .padding import compute_unpadded_indices, pad, unpad
 
 __all__ = [
@@ -18,4 +18,5 @@ __all__ = [
     "low_rank_project",
     "normalize_gate_logits",
     "select_mode",
+    "KernelMode",
 ]

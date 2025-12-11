@@ -1,26 +1,22 @@
-"""Kernel registry and exports."""
+"""Kernel implementations.
 
-from .base import GridConfig, KernelMode, SelectiveKernelProtocol
+Currently provides pure JAX reference kernels. Custom Pallas GPU/TPU
+kernels are planned for future releases (see archive/pallas_kernels/).
+
+Available kernels:
+- MambaReferenceKernel: Pure JAX selective SSM using lax.scan
+"""
+
 from .mamba_reference import (
     MambaKernelInputs,
     MambaKernelParams,
     MambaKernelState,
     MambaReferenceKernel,
 )
-from .mamba_pallas import MambaPallasKernel, PALLAS_AVAILABLE
-from .mamba_tpu import MambaTPUKernel, TPU_AVAILABLE, TPU_AVAILABILITY_MESSAGE
 
 __all__ = [
-    "GridConfig",
-    "KernelMode",
-    "SelectiveKernelProtocol",
     "MambaKernelInputs",
     "MambaKernelParams",
     "MambaKernelState",
     "MambaReferenceKernel",
-    "MambaPallasKernel",
-    "PALLAS_AVAILABLE",
-    "MambaTPUKernel",
-    "TPU_AVAILABLE",
-    "TPU_AVAILABILITY_MESSAGE",
 ]
