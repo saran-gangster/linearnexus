@@ -43,6 +43,7 @@ class BenchConfig:
     iters: int
     dtype: str
     use_qk_l2norm: bool
+    seed: int
 
 
 def _dtype_from_str(name: str) -> jnp.dtype:
@@ -173,6 +174,7 @@ def main() -> None:
         iters=args.iters,
         dtype=args.dtype,
         use_qk_l2norm=not args.no_qk_l2norm,
+        seed=args.seed,
     )
 
     if cfg.seq_len <= 0 or cfg.key_dim <= 0 or cfg.value_dim <= 0:
