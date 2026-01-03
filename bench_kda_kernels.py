@@ -49,6 +49,9 @@ class BenchConfig:
     profile_dir: str | None
     profile_steps: int
     profile_which: str
+    profile_format: str
+    perfetto_link: bool
+    memory_profile: str | None
 
 
 def _dtype_from_str(name: str) -> jnp.dtype:
@@ -161,28 +164,61 @@ def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
         print(f"\n--- profiling ---")
         print(f"trace_dir: {trace_dir}")
         print(f"steps: {steps} | which: {which}")
-        print("Tip: open with `tensorboard --logdir <trace_dir>`")
+        if cfg.profile_format == "tensorboard":
+            print("view: tensorboard (optional)")
+        else:
+            print("view: perfetto (no TensorBoard needed)")
+            print("Tip: open https://ui.perfetto.dev and upload the trace file.")
+            if cfg.perfetto_link:
+                print("NOTE: --perfetto-link will BLOCK until opened.")
 
         def _profile_loop(name: str, fn):
             # Warm one iteration to ensure executable is ready
             _ = fn(q, k, v, g, beta)
-            # Start trace
-            profiler.start_trace(trace_dir)
-            for i in range(steps):
-                with profiler.StepTraceAnnotation(f"{name}_step", step_num=i):
-                    out = fn(q, k, v, g, beta)
-                    # block_until_ready to ensure step is captured
-                    if isinstance(out, tuple):
-                        out0 = out[0]
-                    else:
-                        out0 = out
-                    out0.block_until_ready()
-            profiler.stop_trace()
+
+            subdir = os.path.join(trace_dir, name)
+            os.makedirs(subdir, exist_ok=True)
+
+            if cfg.profile_format == "perfetto":
+                # create_perfetto_trace writes an additional Perfetto trace file.
+                # create_perfetto_link prints a link and blocks until opened.
+                ctx = profiler.trace(
+                    subdir,
+                    create_perfetto_trace=True,
+                    create_perfetto_link=cfg.perfetto_link,
+                )
+            else:
+                # TensorBoard format trace
+                ctx = None
+
+            if ctx is None:
+                profiler.start_trace(subdir)
+                try:
+                    for i in range(steps):
+                        with profiler.StepTraceAnnotation(f"{name}_step", step_num=i):
+                            out = fn(q, k, v, g, beta)
+                            out0 = out[0] if isinstance(out, tuple) else out
+                            out0.block_until_ready()
+                finally:
+                    profiler.stop_trace()
+            else:
+                with ctx:
+                    for i in range(steps):
+                        with profiler.StepTraceAnnotation(f"{name}_step", step_num=i):
+                            out = fn(q, k, v, g, beta)
+                            out0 = out[0] if isinstance(out, tuple) else out
+                            out0.block_until_ready()
 
         if which in ("recurrent", "both"):
             _profile_loop("kda_recurrent", rec_jit)
         if which in ("chunkwise", "both"):
             _profile_loop("kda_chunkwise", chk_jit)
+
+        if cfg.memory_profile is not None:
+            mem_path = os.path.abspath(cfg.memory_profile)
+            print(f"\n--- memory profile ---")
+            print(f"writing: {mem_path}")
+            profiler.save_device_memory_profile(mem_path)
 
 
 def main() -> None:
@@ -217,6 +253,27 @@ def main() -> None:
         choices=["recurrent", "chunkwise", "both"],
         help="Which kernel(s) to profile.",
     )
+    p.add_argument(
+        "--profile-format",
+        type=str,
+        default="perfetto",
+        choices=["perfetto", "tensorboard"],
+        help="Trace output format. 'perfetto' works without TensorBoard.",
+    )
+    p.add_argument(
+        "--perfetto-link",
+        action="store_true",
+        help=(
+            "Create and print a Perfetto UI link (BLOCKS until opened). "
+            "Not recommended for Kaggle notebooks."
+        ),
+    )
+    p.add_argument(
+        "--memory-profile",
+        type=str,
+        default=None,
+        help="If set, write a device memory profile to this file.",
+    )
     args = p.parse_args()
 
     cfg = BenchConfig(
@@ -234,6 +291,9 @@ def main() -> None:
         profile_dir=args.profile_dir,
         profile_steps=args.profile_steps,
         profile_which=args.profile_which,
+        profile_format=args.profile_format,
+        perfetto_link=args.perfetto_link,
+        memory_profile=args.memory_profile,
     )
 
     if cfg.seq_len <= 0 or cfg.key_dim <= 0 or cfg.value_dim <= 0:
