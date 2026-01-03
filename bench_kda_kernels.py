@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -76,9 +77,35 @@ def _time_one(fn, *args) -> float:
             if hasattr(x, "block_until_ready"):
                 x.block_until_ready()
     else:
-        out.block_until_ready()
+        if hasattr(out, "block_until_ready"):
+            out.block_until_ready()
     t1 = time.perf_counter()
     return t1 - t0
+
+
+def _pctl(sorted_values: list[float], p: float) -> float:
+    """Nearest-rank percentile for already-sorted values."""
+    if not sorted_values:
+        raise ValueError("No values")
+    if p <= 0:
+        return sorted_values[0]
+    if p >= 1:
+        return sorted_values[-1]
+    idx = int(round(p * (len(sorted_values) - 1)))
+    return sorted_values[idx]
+
+
+def _summarize_times(times: list[float]) -> dict[str, float]:
+    if not times:
+        raise ValueError("No times to summarize")
+    values = sorted(times)
+    return {
+        "avg": statistics.fmean(values),
+        "median": statistics.median(values),
+        "min": values[0],
+        "p90": _pctl(values, 0.90),
+        "max": values[-1],
+    }
 
 
 def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
@@ -169,11 +196,22 @@ def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
         f"chunk={cfg.chunk_size} dtype={cfg.dtype} l2norm={cfg.use_qk_l2norm}"
     )
 
-    # First-run (compile + execute)
-    t_compile_rec = _time_one(rec_jit, q, k, v, g, beta)
-    t_compile_chk = _time_one(chk_jit, q, k, v, g, beta)
-    print(f"compile+1st recurrent: {t_compile_rec*1e3:.2f} ms")
-    print(f"compile+1st chunkwise: {t_compile_chk*1e3:.2f} ms")
+    # Compile-only and first-exec timings.
+    # Note: JAX compilation caches by computation signature; once compiled, the
+    # subsequent call should execute without recompiling.
+    t_compile_only_rec = _time_one(lambda: rec_jit.lower(q, k, v, g, beta).compile())
+    t_first_exec_rec = _time_one(rec_jit, q, k, v, g, beta)
+
+    t_compile_only_chk = _time_one(lambda: chk_jit.lower(q, k, v, g, beta).compile())
+    t_first_exec_chk = _time_one(chk_jit, q, k, v, g, beta)
+
+    print(f"compile-only recurrent: {t_compile_only_rec*1e3:.2f} ms")
+    print(f"1st exec recurrent:     {t_first_exec_rec*1e3:.2f} ms")
+    print(f"compile+1st recurrent:  {(t_compile_only_rec + t_first_exec_rec)*1e3:.2f} ms")
+
+    print(f"compile-only chunkwise: {t_compile_only_chk*1e3:.2f} ms")
+    print(f"1st exec chunkwise:     {t_first_exec_chk*1e3:.2f} ms")
+    print(f"compile+1st chunkwise:  {(t_compile_only_chk + t_first_exec_chk)*1e3:.2f} ms")
 
     # Warmup
     for _ in range(cfg.warmup):
@@ -186,13 +224,29 @@ def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
     rec_times = [_time_one(rec_jit, q, k, v, g, beta) for _ in range(cfg.iters)]
     chk_times = [_time_one(chk_jit, q, k, v, g, beta) for _ in range(cfg.iters)]
 
-    rec_avg = sum(rec_times) / len(rec_times)
-    chk_avg = sum(chk_times) / len(chk_times)
+    rec_stats = _summarize_times(rec_times)
+    chk_stats = _summarize_times(chk_times)
 
     print("\n--- steady-state ---")
-    print(f"recurrent: {rec_avg*1e3:.3f} ms/iter | {tokens/rec_avg:,.0f} tokens/s")
-    print(f"chunkwise: {chk_avg*1e3:.3f} ms/iter | {tokens/chk_avg:,.0f} tokens/s")
-    print(f"speedup (rec/chunk): {rec_avg/chk_avg:.2f}x")
+    print(
+        "recurrent: "
+        f"avg {rec_stats['avg']*1e3:.3f} ms | "
+        f"med {rec_stats['median']*1e3:.3f} ms | "
+        f"p90 {rec_stats['p90']*1e3:.3f} ms | "
+        f"min {rec_stats['min']*1e3:.3f} ms | "
+        f"max {rec_stats['max']*1e3:.3f} ms | "
+        f"{tokens/rec_stats['avg']:,.0f} tok/s"
+    )
+    print(
+        "chunkwise: "
+        f"avg {chk_stats['avg']*1e3:.3f} ms | "
+        f"med {chk_stats['median']*1e3:.3f} ms | "
+        f"p90 {chk_stats['p90']*1e3:.3f} ms | "
+        f"min {chk_stats['min']*1e3:.3f} ms | "
+        f"max {chk_stats['max']*1e3:.3f} ms | "
+        f"{tokens/chk_stats['avg']:,.0f} tok/s"
+    )
+    print(f"speedup (rec/chunk): {rec_stats['avg']/chk_stats['avg']:.2f}x")
 
     # Optional profiler trace (TensorBoard-compatible)
     if cfg.profile_dir is not None:
@@ -269,7 +323,7 @@ def main() -> None:
     p.add_argument("--value-dim", type=int, default=64)
     p.add_argument("--chunk-size", type=int, default=64)
     p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--iters", type=int, default=50)
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--no-qk-l2norm", action="store_true", help="Disable q/k l2norm in kernel")
     p.add_argument("--seed", type=int, default=0)
