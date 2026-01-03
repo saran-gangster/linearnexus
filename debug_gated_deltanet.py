@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Debug script to isolate NaN in Gated DeltaNet (including gradients)."""
+"""Debug script to isolate NaN in Gated DeltaNet with benchmark-like training."""
 
 import sys
 from pathlib import Path
@@ -12,9 +12,12 @@ import optax
 sys.path.insert(0, str(Path(__file__).parent))
 
 from linearnexus.models import ModelConfig, LMModel
+from linearnexus.data import CharTokenizer, TextDataset, DataLoader, download_shakespeare
+from linearnexus.optim import create_optimizer
 from linearnexus.train.base import cross_entropy_loss
 
-def check_nan(name, tensor, verbose=True):
+
+def check_nan(name, tensor, verbose=False):
     """Check if tensor has NaN/Inf and print debug info."""
     has_nan = bool(jnp.any(jnp.isnan(tensor)))
     has_inf = bool(jnp.any(jnp.isinf(tensor)))
@@ -24,44 +27,23 @@ def check_nan(name, tensor, verbose=True):
         max_val = float(jnp.max(tensor))
         mean_val = float(jnp.mean(tensor))
         status = "❌ NaN" if has_nan else ("❌ Inf" if has_inf else "✓")
-        print(f"  {name}: {status} | shape={tensor.shape} | min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}")
+        print(f"  {name}: {status} | min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}")
     
     return has_nan or has_inf
 
 
-def check_grads_for_nan(grads, prefix=""):
-    """Recursively check gradient dict for NaN."""
-    found_nan = False
-    
-    def _check(obj, path=""):
-        nonlocal found_nan
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                _check(v, f"{path}.{k}" if path else k)
-        elif hasattr(obj, 'shape'):  # It's an array
-            has_nan = bool(jnp.any(jnp.isnan(obj)))
-            has_inf = bool(jnp.any(jnp.isinf(obj)))
-            if has_nan or has_inf:
-                found_nan = True
-                status = "❌ NaN" if has_nan else "❌ Inf"
-                print(f"  {prefix}{path}: {status} | shape={obj.shape}")
-    
-    _check(grads)
-    return found_nan
-
-
-def debug_gated_deltanet():
-    """Test gated_deltanet with gradient computation."""
+def debug_training():
+    """Test gated_deltanet with benchmark-like training loop."""
     
     print("=" * 60)
-    print("Gated DeltaNet Gradient Debug")
+    print("Gated DeltaNet Training Debug")
     print("=" * 60)
     
-    # Create config
+    # Use EXACT same config as benchmark_architectures.py
     config = ModelConfig(
         vocab_size=65,
         hidden_size=256,
-        n_layers=2,
+        n_layers=6,  # Same as benchmark
         block_pattern=["gated_deltanet"],
         gated_deltanet_heads=4,
         gated_deltanet_v_heads=4,
@@ -71,7 +53,14 @@ def debug_gated_deltanet():
         gated_deltanet_use_gate=True,
     )
     
+    batch_size = 8
+    seq_len = 128
+    max_steps = 25
+    lr = 3e-4
+    warmup_steps = 5
+    
     print(f"\nConfig: hidden_size={config.hidden_size}, n_layers={config.n_layers}")
+    print(f"Training: batch_size={batch_size}, seq_len={seq_len}, lr={lr}")
     
     # Create model
     print("\n--- Creating Model ---")
@@ -79,27 +68,27 @@ def debug_gated_deltanet():
     model = LMModel(config, rngs=rngs)
     print(f"Model params: {model.count_params():,}")
     
-    # Create batch
-    batch_size, seq_len = 2, 64
-    input_ids = jax.random.randint(jax.random.key(0), (batch_size, seq_len), 0, 65)
-    labels = jax.random.randint(jax.random.key(1), (batch_size, seq_len), 0, 65)
-    batch = {"input_ids": input_ids, "labels": labels}
+    # Download data
+    print("\n--- Loading Data ---")
+    data_path = download_shakespeare()
+    tokenizer = CharTokenizer.from_file(data_path)
+    dataset = TextDataset(data_path, tokenizer, seq_len=seq_len)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, seed=42)
     
-    print(f"\n--- Test Forward Pass ---")
-    logits, _ = model(input_ids)
-    loss = cross_entropy_loss(logits, labels)
-    print(f"Forward loss: {float(loss):.4f}")
+    # Create optimizer
+    optimizer = create_optimizer(
+        "adamw",
+        learning_rate=lr,
+        total_steps=max_steps,
+        warmup_steps=warmup_steps,
+        weight_decay=0.01,
+        grad_clip=1.0,
+    )
     
-    if jnp.isnan(loss) or jnp.isinf(loss):
-        print("❌ Forward pass produces NaN/Inf loss!")
-        return
-    else:
-        print("✓ Forward pass OK")
-    
-    # Split model for gradient computation
-    print("\n--- Testing Gradient Computation ---")
+    # Split model
     graphdef, params_state, rest_state = nnx.split(model, nnx.Param, ...)
     params = nnx.to_pure_dict(params_state)
+    opt_state = optimizer.init(params)
     
     # Define loss function
     def loss_fn(params, batch, graphdef, params_state, rest_state):
@@ -108,51 +97,50 @@ def debug_gated_deltanet():
         logits, _ = merged_model(batch["input_ids"])
         return cross_entropy_loss(logits, batch["labels"])
     
-    # Compute gradients
-    print("Computing gradients...")
-    try:
+    # JIT compile
+    @jax.jit
+    def train_step(params, opt_state, batch, graphdef, params_state, rest_state):
         loss, grads = jax.value_and_grad(loss_fn)(params, batch, graphdef, params_state, rest_state)
-        print(f"Loss from grad computation: {float(loss):.4f}")
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss
+    
+    # Training loop
+    print("\n--- Training Loop ---")
+    data_iter = iter(dataloader)
+    
+    for step in range(max_steps):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
         
-        # Check gradients for NaN
-        print("\n--- Checking Gradients for NaN ---")
-        has_nan_grads = check_grads_for_nan(grads)
+        params, opt_state, loss = train_step(params, opt_state, batch, graphdef, params_state, rest_state)
+        loss_val = float(loss)
         
-        if has_nan_grads:
-            print("\n❌ GRADIENTS CONTAIN NaN/Inf!")
+        print(f"  Step {step+1:3d}: loss={loss_val:.4f}", end="")
+        
+        if jnp.isnan(loss) or jnp.isinf(loss):
+            print(" ❌ NaN/Inf detected!")
+            
+            # Debug: check params
+            print("\n  Checking params for NaN...")
+            def _check_params(obj, path=""):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        _check_params(v, f"{path}.{k}" if path else k)
+                elif hasattr(obj, 'shape'):
+                    if bool(jnp.any(jnp.isnan(obj))) or bool(jnp.any(jnp.isinf(obj))):
+                        print(f"    ❌ {path}: NaN/Inf | shape={obj.shape}")
+            
+            _check_params(params)
+            return
         else:
-            print("\n✓ All gradients are finite!")
-            
-            # Try one optimization step
-            print("\n--- Testing Optimizer Step ---")
-            optimizer = optax.adamw(learning_rate=1e-4)
-            opt_state = optimizer.init(params)
-            updates, new_opt_state = optimizer.update(grads, opt_state, params)
-            new_params = optax.apply_updates(params, updates)
-            
-            # Check new params for NaN
-            print("Checking updated params...")
-            has_nan_params = check_grads_for_nan(new_params, prefix="param: ")
-            
-            if has_nan_params:
-                print("\n❌ UPDATED PARAMS CONTAIN NaN!")
-            else:
-                print("\n✓ Updated params are finite!")
-                
-                # Compute loss with new params
-                loss2 = loss_fn(new_params, batch, graphdef, params_state, rest_state)
-                print(f"\nLoss after 1 step: {float(loss2):.4f}")
-                
-                if jnp.isnan(loss2) or jnp.isinf(loss2):
-                    print("❌ Loss became NaN/Inf after 1 step!")
-                else:
-                    print("✓ Training step successful!")
-        
-    except Exception as e:
-        print(f"❌ Gradient computation failed: {e}")
-        import traceback
-        traceback.print_exc()
+            print(" ✓")
+    
+    print(f"\n✓ Training completed {max_steps} steps without NaN!")
 
 
 if __name__ == "__main__":
-    debug_gated_deltanet()
+    debug_training()
