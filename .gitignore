@@ -92,8 +92,8 @@ data/
 *.safetensors
 *.ckpt
 kda_trace/
-
 kda_ir/
+
 # Temporary files
 tmp/
 temp/
