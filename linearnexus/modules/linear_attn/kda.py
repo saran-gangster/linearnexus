@@ -440,6 +440,14 @@ def kda_chunkwise(
     def _exp_leq0(x: jax.Array) -> jax.Array:
         return jnp.exp(jnp.minimum(x, 0.0)).astype(jnp.float32)
 
+    def _masked_exp(d: jax.Array, mask: jax.Array) -> jax.Array:
+        """Exponentiate with non-causal entries forced to zero.
+
+        Uses `exp(-inf) = 0` rather than compute-then-mask.
+        """
+        neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
+        return jnp.exp(jnp.where(mask, d, neg_inf)).astype(jnp.float32)
+
     def build_m_and_aqk(
         q_all: jax.Array,
         k_all: jax.Array,
@@ -476,19 +484,20 @@ def kda_chunkwise(
             beta_rows = lax.dynamic_slice(beta_all, (0, 0, 0, r0), (B_, H_, N_, BC))
             g_ref = lax.dynamic_slice(g_all, (0, 0, 0, r0, 0), (B_, H_, N_, 1, K_))[:, :, :, 0, :]
 
-            exp_rel_diag = _exp_leq0(g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :])
+            d_diag = g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :]
+            exp_rel_strict = _masked_exp(d_diag, tril_strict[None, None, None, :, :, None])
+            exp_rel_incl = _masked_exp(d_diag, tril_inclusive[None, None, None, :, :, None])
+
             A0_diag = jnp.sum(
-                (k_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
+                (k_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_strict,
                 axis=-1,
             )
             Aqk_diag = jnp.sum(
-                (q_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
+                (q_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_incl,
                 axis=-1,
             )
 
             A0_diag = A0_diag * beta_rows[:, :, :, :, None]
-            A0_diag = jnp.where(tril_strict[None, None, None, :, :], A0_diag, 0.0)
-            Aqk_diag = jnp.where(tril_inclusive[None, None, None, :, :], Aqk_diag, 0.0)
 
             M_diag_blk = eye_bc + A0_diag
             M_acc = lax.dynamic_update_slice(M_acc, M_diag_blk, (0, 0, 0, r0, r0))
