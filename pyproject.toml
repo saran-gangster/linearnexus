@@ -38,6 +38,21 @@ full = [
   "wandb>=0.16.0",        # Logging
   "tqdm>=4.66.0",         # Progress bars
 ]
+# NVIDIA CUDA 13 installation (Linux only)
+# Usage: pip install -e ".[cuda13]"
+cuda13 = [
+  "jax[cuda13]",
+]
+# NVIDIA CUDA 12 installation (Linux only)
+# Usage: pip install -e ".[cuda12]"
+cuda12 = [
+  "jax[cuda12]",
+]
+# Google Cloud TPU installation
+# Usage: pip install -e ".[tpu]"
+tpu = [
+  "jax[tpu]",
+]
 
 [project.scripts]
 linearnexus-train = "linearnexus.train:main"
