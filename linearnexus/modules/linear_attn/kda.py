@@ -441,8 +441,13 @@ def kda_chunkwise(
         return jnp.exp(jnp.minimum(x, 0.0)).astype(jnp.float32)
 
     def build_matrices_for_chunk(q_chunk, k_chunk, g_chunk, beta_chunk):
-        """Build A0 and Aqk matrices using lax.fori_loop to prevent unrolling."""
+        """Build A0 and Aqk matrices using lax.fori_loop to prevent unrolling.
+        
+        This avoids XLA unrolling the nested loops which causes massive IR bloat
+        and slow compile times.
+        """
         B_, H_, N_, _, K_ = q_chunk.shape
+        V_ = v.shape[-1]  # Get value dim from outer scope
         
         # Initialize output matrices
         A0_full = jnp.zeros((B_, H_, N_, BT, BT), dtype=jnp.float32)
@@ -500,7 +505,7 @@ def kda_chunkwise(
                 A0_blk = A0_blk * beta_rows[:, :, :, :, None]
                 Aqk_blk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
                 
-                # Update block in output
+                # Update block in output - only update if j < i (handled by loop bounds)
                 A0_inner = lax.dynamic_update_slice(A0_inner, A0_blk, (0, 0, 0, r0, c0))
                 Aqk_inner = lax.dynamic_update_slice(Aqk_inner, Aqk_blk, (0, 0, 0, r0, c0))
                 
@@ -517,6 +522,9 @@ def kda_chunkwise(
         return A0_full, Aqk_full
 
     A0, Aqk = build_matrices_for_chunk(q, k, g, beta)
+
+    # Multiply by beta (row-wise): A0 *= beta[row]
+    # (Already applied in the blockwise construction)
 
     # Mask diagonal and upper triangle, then negate: L = -A0 where col < row else 0
     diag_upper = jnp.triu(jnp.ones((BT, BT), dtype=bool), k=0)
