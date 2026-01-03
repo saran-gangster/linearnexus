@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-01-04 01:46:45",
+  "device": "TFRT_CPU_0",
+  "results": [
+    {
+      "arch_name": "gated_deltanet",
+      "param_count": 6161256,
+      "final_loss": 3.6271121501922607,
+      "final_perplexity": 37.60406494140625,
+      "loss_history": [
+        4.651303291320801,
+        4.549804210662842,
+        3.9576079845428467,
+        3.6271121501922607
+      ],
+      "wall_time": 60.85434532165527,
+      "tokens_per_sec": 1013.7550405979924,
+      "passed": true,
+      "error": null
+    },
+    {
+      "arch_name": "kda",
+      "param_count": 6813984,
+      "final_loss": 4.0282158851623535,
+      "final_perplexity": 56.16062545776367,
+      "loss_history": [
+        4.784891128540039,
+        4.522761821746826,
+        4.1531267166137695,
+        4.0282158851623535
+      ],
+      "wall_time": 93.72492146492004,
+      "tokens_per_sec": 657.774410609667,
+      "passed": true,
+      "error": null
+    }
+  ]
+}

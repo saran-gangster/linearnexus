@@ -569,13 +569,33 @@ def kda_chunkwise(
     rhs_w = beta[..., None] * (k * exp_g)  # [N, B, H, BT, K]
     rhs_u = beta[..., None] * v            # [N, B, H, BT, V]
     rhs = jnp.concatenate([rhs_w, rhs_u], axis=-1)
-    solved = jax.lax.linalg.triangular_solve(
-        M,
-        rhs,
-        left_side=True,
-        lower=True,
-        unit_diagonal=True,
-    )
+    # Solve M @ solved = rhs, where M is lower-triangular with unit diagonal.
+    # Using an explicit forward-substitution avoids NaN gradients that can arise
+    # from autodiff through triangular_solve in deep stacks.
+    def _unit_lower_solve(L: jax.Array, B: jax.Array) -> jax.Array:
+        """Solve L X = B for unit-lower-triangular L.
+
+        Args:
+            L: [..., BT, BT]
+            B: [..., BT, D]
+        Returns:
+            X: [..., BT, D]
+        """
+        BT_ = L.shape[-1]
+        D_ = B.shape[-1]
+        X0 = jnp.zeros(L.shape[:-2] + (BT_, D_), dtype=B.dtype)
+
+        def step(X, t):
+            L_row = L[..., t, :]
+            contrib = jnp.einsum("...j,...jd->...d", L_row, X)
+            x_t = B[..., t, :] - contrib
+            X = X.at[..., t, :].set(x_t)
+            return X, None
+
+        X, _ = lax.scan(step, X0, jnp.arange(BT_))
+        return X
+
+    solved = _unit_lower_solve(M, rhs)
     w = solved[..., :key_dim]
     u = solved[..., key_dim:]
 
@@ -611,8 +631,10 @@ def kda_chunkwise(
         exp_g_last = exp_g_i[:, :, -1, :]  # [B, H, K]
         S_new = S * exp_g_last[..., None]
 
-        # exp(g_last - g_t) = exp_g_last / exp_g_t, with safe division.
-        ratio = jnp.where(exp_g_i > 0.0, exp_g_last[:, :, None, :] / exp_g_i, 0.0)
+        # exp(g_last - g_t) computed in log-space to avoid 0/0 masked division
+        # NaNs in the backward pass when exp_g_i underflows to 0.
+        g_last = g_i[:, :, -1, :]  # [B, H, K]
+        ratio = jnp.exp(jnp.minimum(g_last[:, :, None, :] - g_i, 0.0)).astype(jnp.float32)
         kg_update = ratio * k_i  # [B, H, BT, K]
         S_new = S_new + jnp.einsum(
             "bhkc,bhcv->bhkv",
@@ -631,6 +653,8 @@ def kda_chunkwise(
         o_chunks = o_chunks[:, :, :seq_len, :]
 
     return o_chunks.astype(v.dtype), final_state
+
+
 
 
 # =============================================================================
@@ -910,19 +934,18 @@ class KDABlock(nnx.Module):
 
         if mode == "recurrent" or seq_len == 1:
             if seq_len == 1:
-                # Single step
                 o, new_recurrent_state = kda_step(
-                    q=q[:, :, 0, :],  # [batch, heads, key_dim]
+                    q=q[:, :, 0, :],
                     k=k[:, :, 0, :],
                     v=v[:, :, 0, :],
                     g=g[:, :, 0, :],
                     beta=beta[:, :, 0],
-                    state=recurrent_state if recurrent_state is not None else jnp.zeros(
-                        (batch, self.num_v_heads, self.head_k_dim, self.head_v_dim)
-                    ),
+                    state=recurrent_state
+                    if recurrent_state is not None
+                    else jnp.zeros((batch, self.num_v_heads, self.head_k_dim, self.head_v_dim)),
                     use_qk_l2norm=True,
                 )
-                o = o[:, :, None, :]  # [batch, heads, 1, value_dim]
+                o = o[:, :, None, :]
             else:
                 o, new_recurrent_state = kda_recurrent(
                     q=q,
