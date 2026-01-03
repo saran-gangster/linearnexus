@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -33,26 +33,48 @@ from linearnexus.train.base import cross_entropy_loss
 
 
 # =============================================================================
-# Standardized Model Configurations (~3-5M params each for fair comparison)
+# Parameter-Matched Model Configurations
 # =============================================================================
 
-def get_standardized_configs(vocab_size: int = 65) -> Dict[str, ModelConfig]:
-    """Get model configs with standardized sizes for fair comparison."""
-    
-    hidden_size = 256
-    n_layers = 6
-    
-    return {
-        "gpt": ModelConfig(
+
+def _count_params_for_config(config: ModelConfig) -> int:
+    """Instantiate an `LMModel` and return its parameter count.
+
+    This is used for benchmarking config auto-tuning (no training).
+    """
+    model = LMModel(config, rngs=nnx.Rngs(0))
+    return int(model.count_params())
+
+
+def _arch_config(
+    arch: str,
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    n_layers: int,
+) -> ModelConfig:
+    """Create a ModelConfig for a given architecture at a given hidden size.
+
+    Notes:
+    - We choose head dims that keep shapes valid for each architecture.
+    - We scale low-rank dims for RWKV6 with hidden_size to keep ratios stable.
+    """
+    if arch == "gpt":
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            n_heads=8,
-            head_dim=32,
+            n_heads=n_heads,
+            head_dim=head_dim,
             block_pattern=["attention"],
             intermediate_size=hidden_size * 4,
-        ),
-        "mamba": ModelConfig(
+        )
+
+    if arch == "mamba":
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
@@ -60,76 +82,380 @@ def get_standardized_configs(vocab_size: int = 65) -> Dict[str, ModelConfig]:
             state_size=16,
             conv_kernel=4,
             intermediate_size=hidden_size * 2,
-        ),
-        "mamba2": ModelConfig(
+        )
+
+    if arch == "mamba2":
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
             block_pattern=["mamba2"],
-            mamba2_heads=8,
-            mamba2_head_dim=32,
+            mamba2_heads=n_heads,
+            mamba2_head_dim=head_dim,
             mamba2_state_size=64,
             mamba2_n_groups=1,
-        ),
-        "deltanet": ModelConfig(
+        )
+
+    if arch == "deltanet":
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            n_heads=8,
+            n_heads=n_heads,
+            head_dim=head_dim,
             block_pattern=["deltanet"],
-            deltanet_heads=8,
+            deltanet_heads=n_heads,
             deltanet_expand_k=1.0,
             deltanet_expand_v=1.0,
             deltanet_use_beta=True,
             deltanet_use_gate=False,
             deltanet_use_short_conv=True,
             deltanet_chunk_size=32,
-        ),
-        "gated_deltanet": ModelConfig(
+        )
+
+    if arch == "gated_deltanet":
+        # Keep Mamba2-style head dim (but smaller than the default preset)
+        head_dim = 64
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
             block_pattern=["gated_deltanet"],
-            gated_deltanet_heads=4,
-            gated_deltanet_v_heads=4,
-            gated_deltanet_head_dim=64,
+            gated_deltanet_heads=n_heads,
+            gated_deltanet_v_heads=n_heads,
+            gated_deltanet_head_dim=head_dim,
             gated_deltanet_expand_v=2.0,
             gated_deltanet_use_short_conv=True,
             gated_deltanet_use_gate=True,
-        ),
-        "rwkv6": ModelConfig(
+        )
+
+    if arch == "rwkv6":
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        proj_rank = max(8, hidden_size // 8)   # 256 -> 32
+        gate_rank = max(8, hidden_size // 4)   # 256 -> 64
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            n_heads=8,
+            n_heads=n_heads,
+            head_dim=head_dim,
             block_pattern=["rwkv6"],
-            rwkv6_heads=8,
-            rwkv6_proj_low_rank_dim=32,
-            rwkv6_gate_low_rank_dim=64,
+            rwkv6_heads=n_heads,
+            rwkv6_proj_low_rank_dim=proj_rank,
+            rwkv6_gate_low_rank_dim=gate_rank,
             rwkv6_intermediate_size=hidden_size * 4,
-        ),
-        "rwkv7": ModelConfig(
+        )
+
+    if arch == "rwkv7":
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            n_heads=8,
+            n_heads=n_heads,
+            head_dim=head_dim,
             block_pattern=["rwkv7"],
-            rwkv7_heads=8,
-            rwkv7_head_dim=32,
-        ),
-        "kda": ModelConfig(
+            rwkv7_heads=n_heads,
+            rwkv7_head_dim=head_dim,
+        )
+
+    if arch == "kda":
+        head_dim = 64
+        n_heads = max(1, hidden_size // head_dim)
+        hidden_size = n_heads * head_dim
+        return ModelConfig(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             n_layers=n_layers,
-            n_heads=8,
+            n_heads=n_heads,
+            head_dim=max(1, hidden_size // n_heads),
             block_pattern=["kda"],
-            kda_heads=4,
-            kda_v_heads=4,
-            kda_head_dim=64,
+            kda_heads=n_heads,
+            kda_v_heads=n_heads,
+            kda_head_dim=head_dim,
             kda_expand_v=1.0,
             kda_use_short_conv=True,
-        ),
-    }
+        )
+
+    raise ValueError(f"Unknown architecture: {arch}")
+
+
+def _default_hidden_candidates(arch: str, *, base_hidden_size: int) -> List[int]:
+    """Generate candidate hidden sizes, respecting head-dim divisibility."""
+    if arch in {"gated_deltanet", "kda"}:
+        step = 64
+    else:
+        step = 32
+
+    lo = max(step, int(base_hidden_size * 0.5))
+    hi = int(base_hidden_size * 2.0)
+    lo = (lo // step) * step
+    hi = (hi // step) * step
+    if lo < step:
+        lo = step
+    if hi < lo:
+        hi = lo
+    return list(range(lo, hi + 1, step))
+
+
+def _arch_candidate_configs(
+    arch: str,
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    n_layers: int,
+) -> List[ModelConfig]:
+    """Generate a small candidate grid per architecture.
+
+    Different blocks have fundamentally different parameterization; matching
+    params well typically requires adjusting at least one additional knob.
+    """
+    if arch == "mamba2":
+        # Mamba2 parameter count is quite sensitive to state size.
+        candidates: List[ModelConfig] = []
+        for state_size in (32, 64, 128):
+            cfg = _arch_config(
+                arch,
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                n_layers=n_layers,
+            )
+            cfg.mamba2_state_size = state_size
+            candidates.append(cfg)
+        return candidates
+
+    if arch == "mamba":
+        # Vary state size to better match parameter budgets.
+        candidates: List[ModelConfig] = []
+        for state_size in (8, 16, 32):
+            cfg = _arch_config(
+                arch,
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                n_layers=n_layers,
+            )
+            cfg.state_size = state_size
+            candidates.append(cfg)
+        return candidates
+
+    if arch == "gated_deltanet":
+        # Gated DeltaNet has extra value expansion and head_dim choices.
+        candidates = []
+        for head_dim in (32, 64, 128):
+            for expand_v in (1.0, 1.5, 2.0):
+                n_heads = max(1, hidden_size // head_dim)
+                hs = n_heads * head_dim
+                cfg = ModelConfig(
+                    vocab_size=vocab_size,
+                    hidden_size=hs,
+                    n_layers=n_layers,
+                    block_pattern=["gated_deltanet"],
+                    gated_deltanet_heads=n_heads,
+                    gated_deltanet_v_heads=n_heads,
+                    gated_deltanet_head_dim=head_dim,
+                    gated_deltanet_expand_v=expand_v,
+                    gated_deltanet_use_short_conv=True,
+                    gated_deltanet_use_gate=True,
+                )
+                candidates.append(cfg)
+        return candidates
+
+    if arch == "rwkv6":
+        # RWKV6 has explicit FFN intermediate size and low-rank dims.
+        candidates = []
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hs = n_heads * head_dim
+        for ffn_mult in (2, 4):
+            for proj_div, gate_div in ((16, 8), (8, 4), (6, 3)):
+                proj_rank = max(8, hs // proj_div)
+                gate_rank = max(8, hs // gate_div)
+                cfg = ModelConfig(
+                    vocab_size=vocab_size,
+                    hidden_size=hs,
+                    n_layers=n_layers,
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    block_pattern=["rwkv6"],
+                    rwkv6_heads=n_heads,
+                    rwkv6_proj_low_rank_dim=proj_rank,
+                    rwkv6_gate_low_rank_dim=gate_rank,
+                    rwkv6_intermediate_size=hs * ffn_mult,
+                )
+                candidates.append(cfg)
+        return candidates
+
+    if arch == "kda":
+        # KDA can vary head_dim and value expansion.
+        candidates = []
+        for head_dim in (32, 64, 128):
+            for expand_v in (0.5, 1.0):
+                n_heads = max(1, hidden_size // head_dim)
+                hs = n_heads * head_dim
+                cfg = ModelConfig(
+                    vocab_size=vocab_size,
+                    hidden_size=hs,
+                    n_layers=n_layers,
+                    n_heads=max(1, hs // max(1, hs // n_heads)),
+                    head_dim=max(1, hs // n_heads),
+                    block_pattern=["kda"],
+                    kda_heads=n_heads,
+                    kda_v_heads=n_heads,
+                    kda_head_dim=head_dim,
+                    kda_expand_v=expand_v,
+                    kda_use_short_conv=True,
+                )
+                candidates.append(cfg)
+        return candidates
+
+    if arch == "deltanet":
+        candidates = []
+        head_dim = 32
+        n_heads = max(1, hidden_size // head_dim)
+        hs = n_heads * head_dim
+        for expand_k in (1.0, 1.5):
+            for expand_v in (1.0, 1.5, 2.0):
+                cfg = ModelConfig(
+                    vocab_size=vocab_size,
+                    hidden_size=hs,
+                    n_layers=n_layers,
+                    n_heads=n_heads,
+                    head_dim=head_dim,
+                    block_pattern=["deltanet"],
+                    deltanet_heads=n_heads,
+                    deltanet_expand_k=expand_k,
+                    deltanet_expand_v=expand_v,
+                    deltanet_use_beta=True,
+                    deltanet_use_gate=False,
+                    deltanet_use_short_conv=True,
+                    deltanet_chunk_size=64,
+                )
+                candidates.append(cfg)
+        return candidates
+
+    # Default: hidden_size-only.
+    return [
+        _arch_config(
+            arch,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            n_layers=n_layers,
+        )
+    ]
+
+
+def _tune_hidden_size_for_param_budget(
+    arch: str,
+    *,
+    vocab_size: int,
+    n_layers: int,
+    target_params: int,
+    candidates: List[int],
+) -> Tuple[ModelConfig, int]:
+    """Pick the candidate hidden_size that best matches target_params."""
+    best_config: Optional[ModelConfig] = None
+    best_params: Optional[int] = None
+    best_err: Optional[int] = None
+
+    for hidden_size in candidates:
+        for config in _arch_candidate_configs(
+            arch,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            n_layers=n_layers,
+        ):
+            params = _count_params_for_config(config)
+            err = abs(params - target_params)
+            if best_err is None or err < best_err:
+                best_err = err
+                best_config = config
+                best_params = params
+
+    assert best_config is not None and best_params is not None
+    return best_config, best_params
+
+
+def get_standardized_configs(
+    vocab_size: int = 65,
+    *,
+    n_layers: int = 6,
+    base_hidden_size: int = 256,
+    reference_arch: str = "gpt",
+    target_params: Optional[int] = None,
+    search_hidden_sizes: Optional[Dict[str, List[int]]] = None,
+) -> Dict[str, ModelConfig]:
+    """Get model configs with (approximately) matched parameter counts.
+
+    The original benchmark used identical hyperparameters across architectures,
+    which can yield large parameter-count differences due to different internal
+    parameterizations. This helper instead chooses per-architecture `hidden_size`
+    (and derived head counts) to match a single target parameter budget as
+    closely as possible.
+
+    Args:
+        vocab_size: Vocabulary size.
+        n_layers: Number of layers per architecture.
+        base_hidden_size: Starting hidden size for the reference architecture.
+        reference_arch: Architecture used to define the parameter budget.
+        target_params: If provided, use this as the param budget instead of
+            computing from the reference architecture.
+        search_hidden_sizes: Optional per-arch candidate hidden sizes.
+
+    Returns:
+        Dict mapping architecture name to parameter-matched ModelConfig.
+    """
+    archs = ["gpt", "mamba", "mamba2", "deltanet", "gated_deltanet", "rwkv6", "rwkv7", "kda"]
+
+    # Compute target parameter budget from reference architecture.
+    if target_params is None:
+        ref_cfg = _arch_config(
+            reference_arch,
+            vocab_size=vocab_size,
+            hidden_size=base_hidden_size,
+            n_layers=n_layers,
+        )
+        target_params = _count_params_for_config(ref_cfg)
+
+    configs: Dict[str, ModelConfig] = {}
+
+    for arch in archs:
+        if arch == reference_arch:
+            configs[arch] = _arch_config(
+                arch,
+                vocab_size=vocab_size,
+                hidden_size=base_hidden_size,
+                n_layers=n_layers,
+            )
+            continue
+
+        candidates = (
+            search_hidden_sizes.get(arch)
+            if search_hidden_sizes is not None and arch in search_hidden_sizes
+            else _default_hidden_candidates(arch, base_hidden_size=base_hidden_size)
+        )
+
+        tuned_cfg, _ = _tune_hidden_size_for_param_budget(
+            arch,
+            vocab_size=vocab_size,
+            n_layers=n_layers,
+            target_params=target_params,
+            candidates=candidates,
+        )
+        configs[arch] = tuned_cfg
+
+    return configs
 
 
 @dataclass

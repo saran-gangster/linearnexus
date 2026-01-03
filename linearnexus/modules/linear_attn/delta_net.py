@@ -125,6 +125,7 @@ def delta_rule_recurrent(
     v: jax.Array,  # [batch, heads, seq_len, value_dim]
     beta: jax.Array,  # [batch, heads, seq_len]
     initial_state: Optional[jax.Array] = None,  # [batch, heads, key_dim, value_dim]
+    scale: Optional[float] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Token-by-token delta rule recurrence (Reference Implementation).
 
@@ -143,16 +144,26 @@ def delta_rule_recurrent(
     """
     batch, heads, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
+    orig_dtype = q.dtype
+
+    if scale is None:
+        scale = key_dim**-0.5
 
     # Handle beta shape
     if beta.ndim == 4:
         beta = beta.squeeze(-1)
 
+    # Compute in float32 for numerical stability (matches FLA kernels).
+    q = q.astype(jnp.float32) * jnp.asarray(scale, dtype=jnp.float32)
+    k = k.astype(jnp.float32)
+    v = v.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+
     # Initialize state
     if initial_state is None:
-        S = jnp.zeros((batch, heads, key_dim, value_dim), dtype=q.dtype)
+        S = jnp.zeros((batch, heads, key_dim, value_dim), dtype=jnp.float32)
     else:
-        S = initial_state.astype(q.dtype)
+        S = initial_state.astype(jnp.float32)
 
     def step(S, inputs):
         """Single step: S @ k -> delta -> update -> query."""
@@ -186,7 +197,7 @@ def delta_rule_recurrent(
     # Transpose output back: [batch, heads, seq, value_dim]
     output = jnp.transpose(outputs, (1, 2, 0, 3))
 
-    return output, final_state
+    return output.astype(orig_dtype), final_state
 
 
 def delta_rule_chunkwise(
@@ -196,6 +207,7 @@ def delta_rule_chunkwise(
     beta: jax.Array,  # [batch, heads, seq_len]
     initial_state: Optional[jax.Array] = None,
     chunk_size: int = 64,
+    scale: Optional[float] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Chunkwise parallel delta rule using WY representation.
 
@@ -220,9 +232,19 @@ def delta_rule_chunkwise(
     """
     batch, heads, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
+    orig_dtype = q.dtype
+
+    if scale is None:
+        scale = key_dim**-0.5
 
     if beta.ndim == 4:
         beta = beta.squeeze(-1)
+
+    # Compute in float32 for numerical stability and apply query scaling.
+    q = q.astype(jnp.float32) * jnp.asarray(scale, dtype=jnp.float32)
+    k = k.astype(jnp.float32)
+    v = v.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
 
     # Pad to multiple of chunk_size
     pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
@@ -243,9 +265,9 @@ def delta_rule_chunkwise(
 
     # Initialize state
     if initial_state is None:
-        S = jnp.zeros((batch, heads, key_dim, value_dim), dtype=q.dtype)
+        S = jnp.zeros((batch, heads, key_dim, value_dim), dtype=jnp.float32)
     else:
-        S = initial_state.astype(q.dtype)
+        S = initial_state.astype(jnp.float32)
 
     def process_chunk(S, chunk_inputs):
         """Process one chunk using WY decomposition."""
@@ -256,12 +278,12 @@ def delta_rule_chunkwise(
         kk = jnp.einsum("bhik,bhjk->bhij", k_c, k_c)
 
         # A = I + diag(beta) @ tril(K K^T, -1)
-        mask_lower = jnp.tril(jnp.ones((L, L)), k=-1)
+        mask_lower = jnp.tril(jnp.ones((L, L), dtype=jnp.float32), k=-1)
         M = kk * mask_lower
         A = jnp.eye(L) + beta_c[..., None] * M
 
         # Solve A @ T = diag(beta) for T
-        diag_beta = jnp.eye(L) * beta_c[..., None]
+        diag_beta = jnp.eye(L, dtype=jnp.float32) * beta_c[..., None]
         T = jax.lax.linalg.triangular_solve(A, diag_beta, left_side=True, lower=True)
 
         # W = T @ K, U = T @ V
@@ -277,7 +299,7 @@ def delta_rule_chunkwise(
 
         # Intra-chunk: O_intra = (Q K^T ⊙ mask) @ correction
         qk = jnp.einsum("bhik,bhjk->bhij", q_c, k_c)
-        causal_mask = jnp.tril(jnp.ones((L, L)))
+        causal_mask = jnp.tril(jnp.ones((L, L), dtype=jnp.float32))
         qk_masked = qk * causal_mask
         O_intra = jnp.einsum("bhij,bhjv->bhiv", qk_masked, correction)
 
@@ -308,7 +330,7 @@ def delta_rule_chunkwise(
     if pad_len > 0:
         output = output[:, :, :seq_len, :]
 
-    return output, final_state
+    return output.astype(orig_dtype), final_state
 
 
 def delta_rule_step(
@@ -317,6 +339,7 @@ def delta_rule_step(
     v: jax.Array,  # [batch, heads, value_dim]
     beta: jax.Array,  # [batch, heads]
     state: jax.Array,  # [batch, heads, key_dim, value_dim]
+    scale: Optional[float] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Single step of delta rule for autoregressive generation.
 
@@ -334,12 +357,23 @@ def delta_rule_step(
     if beta.ndim == 3:
         beta = beta.squeeze(-1)
 
+    key_dim = q.shape[-1]
+    if scale is None:
+        scale = key_dim**-0.5
+
+    orig_dtype = q.dtype
+    q = q.astype(jnp.float32) * jnp.asarray(scale, dtype=jnp.float32)
+    k = k.astype(jnp.float32)
+    v = v.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+    state = state.astype(jnp.float32)
+
     v_old = jnp.einsum("bhkv,bhk->bhv", state, k)
     v_delta = beta[..., None] * (v - v_old)
     new_state = state + jnp.einsum("bhk,bhv->bhkv", k, v_delta)
     output = jnp.einsum("bhk,bhkv->bhv", q, new_state)
 
-    return output, new_state
+    return output.astype(orig_dtype), new_state
 
 
 # =============================================================================
@@ -418,6 +452,9 @@ class DeltaNetBlock(nnx.Module):
 
         self.norm = RMSNorm(hidden_size, eps=norm_eps, rngs=rngs)
 
+        # Output normalization (per-head value dim), matching FLA's o_norm behavior.
+        self.o_norm = RMSNorm(self.value_dim, eps=norm_eps, rngs=rngs)
+
         # Projections
         self.qkv_proj = nnx.Linear(
             hidden_size, qk_total + qk_total + v_total, use_bias=False, rngs=rngs
@@ -477,8 +514,9 @@ class DeltaNetBlock(nnx.Module):
             q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
             k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
         elif self.qk_norm_type == "sum":
-            q = q / (jnp.sum(jnp.abs(q), axis=-1, keepdims=True) + 1e-6)
-            k = k / (jnp.sum(jnp.abs(k), axis=-1, keepdims=True) + 1e-6)
+            # Match FLA's sum_norm: divide by sum (no abs).
+            q = q / (jnp.sum(q, axis=-1, keepdims=True) + 1e-6)
+            k = k / (jnp.sum(k, axis=-1, keepdims=True) + 1e-6)
         return q, k
 
     def __call__(
@@ -538,6 +576,8 @@ class DeltaNetBlock(nnx.Module):
         # Apply activation
         q = self._apply_activation(q)
         k = self._apply_activation(k)
+        # Match FLA: values always use SiLU.
+        v = jax.nn.silu(v)
 
         # Reshape to multi-head
         q = q.reshape(batch, seq_len, heads, key_dim).transpose(0, 2, 1, 3)
@@ -558,10 +598,15 @@ class DeltaNetBlock(nnx.Module):
         # Initial state
         initial_S = state.S if state is not None else None
 
-        # Delta rule attention
+        # Delta rule attention (kernels apply q scaling internally like FLA: scale=1/sqrt(key_dim)).
         if mode == "chunk" and seq_len > 1:
             output, final_S = delta_rule_chunkwise(
-                q, k, v, beta, initial_state=initial_S, chunk_size=self.chunk_size
+                q,
+                k,
+                v,
+                beta,
+                initial_state=initial_S,
+                chunk_size=self.chunk_size,
             )
         else:
             if seq_len == 1:
@@ -571,7 +616,11 @@ class DeltaNetBlock(nnx.Module):
                     else jnp.zeros((batch, heads, key_dim, value_dim), dtype=q.dtype)
                 )
                 out, final_S = delta_rule_step(
-                    q.squeeze(2), k.squeeze(2), v.squeeze(2), beta.squeeze(2), init_S
+                    q.squeeze(2),
+                    k.squeeze(2),
+                    v.squeeze(2),
+                    beta.squeeze(2),
+                    init_S,
                 )
                 output = out[:, :, None, :]
             else:
@@ -579,13 +628,16 @@ class DeltaNetBlock(nnx.Module):
                     q, k, v, beta, initial_state=initial_S
                 )
 
-        # Reshape: [batch, heads, seq, value_dim] -> [batch, seq, v_total]
-        output = output.transpose(0, 2, 1, 3).reshape(batch, seq_len, self.v_total)
-
-        # Gate
+        # Output norm + optional gate (closer to FLA layer semantics).
+        # output currently: [batch, heads, seq, value_dim]
+        output = output.transpose(0, 2, 1, 3)  # [batch, seq, heads, value_dim]
+        output = self.o_norm(output)
         if self.use_gate:
-            gate = jax.nn.sigmoid(self.gate_proj(normed))
+            gate = jax.nn.sigmoid(self.gate_proj(normed)).reshape(batch, seq_len, heads, value_dim)
             output = output * gate
+
+        # Flatten: [batch, seq, heads, value_dim] -> [batch, seq, v_total]
+        output = output.reshape(batch, seq_len, self.v_total)
 
         # Output projection
         output = self.out_proj(output)
