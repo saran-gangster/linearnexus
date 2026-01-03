@@ -15,7 +15,7 @@ Core Recurrence (Token-by-Token)
 For each token t:
     1. Apply per-dim decay:   S = S * exp(g_t)  where g_t is [heads, key_dim, 1]
     2. Retrieve old value:    v_old = sum(k_t[:, None] * S, axis=-2)
-    3. Compute delta:         v_delta = beta_t * (v_t - v_old)
+    3. Compute delta:         v_delta = (v_t - v_old)
     4. Update state:          S = S + (beta_t * k_t)[:, None] @ v_delta^T
     5. Query output:          o_t = sum(q_t[:, None] * S, axis=-2)
 
@@ -194,7 +194,7 @@ def kda_recurrent(
     Recurrence:
         S = S * exp(g_t)[..., None]  # per-dim decay
         v_old = einsum('bhkv,bhk->bhv', S, k_t)
-        v_delta = beta_t * (v_t - v_old)
+        v_delta = (v_t - v_old)
         S = S + einsum('bhk,bhv->bhkv', beta_t * k_t, v_delta)
         o_t = einsum('bhk,bhkv->bhv', q_t, S)
 
@@ -256,11 +256,11 @@ def kda_recurrent(
         # S: [batch, heads, key_dim, value_dim]
         v_old = jnp.einsum("bhk,bhkv->bhv", k_t, S)
 
-        # 3. Compute delta: v_delta = beta_t * (v_t - v_old)
-        v_delta = beta_t[..., None] * (v_t - v_old)
+        # 3. Compute delta: v_delta = (v_t - v_old)
+        v_delta = v_t - v_old
 
         # 4. Update state: S = S + (beta_t * k_t) @ v_delta^T
-        # Note: FLA uses beta_t * k_t in the outer product
+        # IMPORTANT: beta is applied exactly once (matches FLA reference).
         S_new = S + jnp.einsum("bhk,bhv->bhkv", beta_t[..., None] * k_t, v_delta)
 
         # 5. Query output: o_t = sum(q_t[..., None] * S, axis=-2)
@@ -335,10 +335,10 @@ def kda_step(
     # 2. Retrieve old value
     v_old = jnp.einsum("bhk,bhkv->bhv", k, S)
 
-    # 3. Compute delta
-    v_delta = beta[..., None] * (v - v_old)
+    # 3. Compute delta (beta is applied in the outer-product update)
+    v_delta = v - v_old
 
-    # 4. Update state
+    # 4. Update state (beta applied exactly once)
     S_new = S + jnp.einsum("bhk,bhv->bhkv", beta[..., None] * k, v_delta)
 
     # 5. Query output
