@@ -38,6 +38,11 @@ full = [
   "wandb>=0.16.0",        # Logging
   "tqdm>=4.66.0",         # Progress bars
 ]
+# NVIDIA CUDA 12 installation (Linux only)
+# Usage: pip install -e ".[cuda12]"
+cuda12 = [
+  "jax[cuda12]",
+]
 # NVIDIA CUDA 13 installation (Linux only)
 # Usage: pip install -e ".[cuda13]"
 cuda13 = [

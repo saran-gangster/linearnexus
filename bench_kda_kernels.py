@@ -52,6 +52,8 @@ class BenchConfig:
     profile_format: str
     perfetto_link: bool
     memory_profile: str | None
+    dump_ir_dir: str | None
+    dump_ir_which: str
 
 
 def _dtype_from_str(name: str) -> jnp.dtype:
@@ -121,6 +123,43 @@ def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
     )
 
     tokens = cfg.batch * cfg.seq_len
+
+    # Optional IR dump (helps map TPU trace "custom-call.*" to real ops)
+    if cfg.dump_ir_dir is not None:
+        dump_dir = os.path.abspath(cfg.dump_ir_dir)
+        os.makedirs(dump_dir, exist_ok=True)
+        print("\n--- IR dump ---")
+        print(f"dir: {dump_dir} | which: {cfg.dump_ir_which}")
+
+        def _dump(name: str, lowered):
+            # Prefer StableHLO (text MLIR) which is usually available.
+            text = None
+            try:
+                text = lowered.as_text()
+            except Exception:
+                pass
+            if text is None:
+                # Fallback: try compiler_ir (API varies by JAX version)
+                try:
+                    ir = lowered.compiler_ir()
+                    text = str(ir)
+                except Exception:
+                    text = "<unable to dump IR>"
+            out_path = os.path.join(dump_dir, f"{name}.mlir")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            print(f"wrote: {out_path}")
+
+            # Print a quick hint if custom calls exist.
+            if "custom_call" in text or "custom-call" in text:
+                print(f"hint: '{name}' IR contains custom calls (search for 'custom_call')")
+
+        if cfg.dump_ir_which in ("recurrent", "both"):
+            lowered = rec_jit.lower(q, k, v, g, beta)
+            _dump("kda_recurrent", lowered)
+        if cfg.dump_ir_which in ("chunkwise", "both"):
+            lowered = chk_jit.lower(q, k, v, g, beta)
+            _dump("kda_chunkwise", lowered)
 
     print("\n=== KDA micro-bench ===")
     print(f"device: {jax.devices()[0]}")
@@ -274,6 +313,19 @@ def main() -> None:
         default=None,
         help="If set, write a device memory profile to this file.",
     )
+    p.add_argument(
+        "--dump-ir-dir",
+        type=str,
+        default=None,
+        help="If set, dump lowered StableHLO/MLIR for the jitted kernels into this directory.",
+    )
+    p.add_argument(
+        "--dump-ir-which",
+        type=str,
+        default="both",
+        choices=["recurrent", "chunkwise", "both"],
+        help="Which kernel(s) to dump IR for.",
+    )
     args = p.parse_args()
 
     cfg = BenchConfig(
@@ -294,6 +346,8 @@ def main() -> None:
         profile_format=args.profile_format,
         perfetto_link=args.perfetto_link,
         memory_profile=args.memory_profile,
+        dump_ir_dir=args.dump_ir_dir,
+        dump_ir_which=args.dump_ir_which,
     )
 
     if cfg.seq_len <= 0 or cfg.key_dim <= 0 or cfg.value_dim <= 0:
