@@ -176,6 +176,7 @@ text = complete(model, tokenizer, "Once upon a time", max_tokens=100)
 | [docs/concepts.md](docs/concepts.md) | 📚 LLM fundamentals explained |
 | [docs/architecture_overview.md](docs/architecture_overview.md) | How the codebase is organized |
 | [docs/training_guide.md](docs/training_guide.md) | Deep dive into training |
+| [docs/testing.md](docs/testing.md) | How to run unit tests + formatting checks |
 | [docs/adding_new_blocks.md](docs/adding_new_blocks.md) | Extending with new architectures |
 | [docs/flax_nnx_quick_reference.md](docs/flax_nnx_quick_reference.md) | Flax NNx patterns |
 

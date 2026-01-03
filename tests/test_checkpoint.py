@@ -162,7 +162,7 @@ class TestSaveLoadOptimizer:
         rngs = nnx.Rngs(42)
         model = LMModel(config, rngs=rngs)
         tx = optax.adamw(1e-3)
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         
         # Do some updates to populate optimizer state
         input_ids = jnp.array([[1, 2, 3, 4]])
@@ -174,7 +174,7 @@ class TestSaveLoadOptimizer:
         
         for _ in range(3):
             grads = nnx.grad(loss_fn)(model)
-            optimizer.update(grads)
+            optimizer.update(model, grads)
         
         # Get output after training
         logits_trained, _ = model(input_ids)
@@ -194,7 +194,7 @@ class TestSaveLoadOptimizer:
             
             # Continue training with loaded optimizer
             grads = nnx.grad(loss_fn)(loaded_model)
-            loaded_optimizer.update(grads)
+            loaded_optimizer.update(model, grads)
         
         print("✓ Save/Load optimizer: OK")
 
@@ -385,7 +385,7 @@ class TestCheckpointManager:
         rngs = nnx.Rngs(42)
         model = LMModel(config, rngs=rngs)
         tx = optax.adamw(1e-3)
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         
         # Train a bit
         input_ids = jnp.array([[1, 2, 3, 4]])
@@ -397,7 +397,7 @@ class TestCheckpointManager:
         
         for _ in range(3):
             grads = nnx.grad(loss_fn)(model)
-            optimizer.update(grads)
+            optimizer.update(model, grads)
         
         logits_trained, _ = model(input_ids)
         
@@ -422,7 +422,7 @@ class TestCheckpointManager:
             
             # Continue training
             grads = nnx.grad(loss_fn)(state.model)
-            state.optimizer.update(grads)
+            state.optimizer.update(state.model, grads)
         
         print("✓ CheckpointManager with optimizer: OK")
 

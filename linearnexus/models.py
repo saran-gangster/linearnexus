@@ -25,14 +25,14 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
 
 from linearnexus.core import ConfigBase
-from linearnexus.modules.common import Embedding, RMSNorm, get_norm
+from linearnexus.modules.common import Embedding, get_norm
 from linearnexus.modules.attention import AttentionBlock, KVCache
 from linearnexus.modules.ssm import MambaBlock, MambaState, Mamba2Block, Mamba2State
 from linearnexus.modules.linear_attn import (
@@ -712,7 +712,7 @@ class LMModel(nnx.Module):
         
         # Create blocks based on pattern
         block_types = config.get_block_types()
-        self.blocks = []
+        self.blocks = nnx.List()
         self.block_types = block_types
         
         for i, block_type in enumerate(block_types):
@@ -853,7 +853,7 @@ class LMModel(nnx.Module):
                     total += value.value.size
                 elif isinstance(value, nnx.Module):
                     total += count_module(value)
-                elif isinstance(value, list):
+                elif isinstance(value, (list, nnx.List)):
                     for item in value:
                         if isinstance(item, nnx.Module):
                             total += count_module(item)

@@ -405,6 +405,7 @@ pip install -e .
 ## Getting Help
 
 - 📖 **Documentation**: See `docs/` folder
+- ✅ **Testing**: See `docs/testing.md` for the full test matrix
 - 🐛 **Issues**: GitHub Issues
 - 💬 **Discussions**: GitHub Discussions
 

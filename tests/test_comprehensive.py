@@ -558,7 +558,7 @@ class TestTrainingPipeline:
         model = LMModel(config, rngs=rngs)
         
         # Use NNx Optimizer
-        optimizer = nnx.Optimizer(model, optax.adam(1e-3))
+        optimizer = nnx.Optimizer(model, optax.adam(1e-3), wrt=nnx.Param)
         
         # Create batch
         input_ids = jax.random.randint(jax.random.PRNGKey(0), (2, 16), 0, 256)
@@ -572,7 +572,7 @@ class TestTrainingPipeline:
         # Single training step
         loss_before = loss_fn(model)
         grads = nnx.grad(loss_fn)(model)
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         loss_after = loss_fn(model)
         
         assert loss_before > 0
@@ -599,7 +599,7 @@ class TestTrainingPipeline:
         model = LMModel(config, rngs=rngs)
         
         # Use NNx Optimizer
-        optimizer = nnx.Optimizer(model, optax.adam(1e-3))
+        optimizer = nnx.Optimizer(model, optax.adam(1e-3), wrt=nnx.Param)
         
         # Training loop
         losses = []
@@ -616,7 +616,7 @@ class TestTrainingPipeline:
             losses.append(float(loss))
             
             grads = nnx.grad(loss_fn)(model)
-            optimizer.update(grads)
+            optimizer.update(model, grads)
         
         assert len(losses) == 3
         print(f"✓ Full training loop: {len(losses)} steps, losses={[f'{l:.4f}' for l in losses]}")
@@ -920,7 +920,7 @@ class TestSaveLoad:
         rngs = nnx.Rngs(42)
         model = LMModel(config, rngs=rngs)
         tx = optax.adam(1e-3)
-        optimizer = nnx.Optimizer(model, tx)
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         
         # Train for a few steps
         for step in range(3):
@@ -932,7 +932,7 @@ class TestSaveLoad:
                 return cross_entropy_loss(logits, labels)
             
             grads = nnx.grad(loss_fn)(model)
-            optimizer.update(grads)
+            optimizer.update(model, grads)
         
         # Get output after training
         test_input = jnp.array([[1, 2, 3, 4]])
@@ -959,7 +959,7 @@ class TestSaveLoad:
             
             loss_before = loss_fn(loaded_model)
             grads = nnx.grad(loss_fn)(loaded_model)
-            loaded_optimizer.update(grads)
+            loaded_optimizer.update(loaded_model, grads)
             loss_after = loss_fn(loaded_model)
             
             # Training should decrease loss
@@ -1249,10 +1249,10 @@ class TestEndToEnd:
         
         # Backward pass using NNx native optimizer
         learning_rate = 0.01
-        optimizer = nnx.Optimizer(model, optax.adam(learning_rate))
+        optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.Param)
         
         grads = nnx.grad(loss_fn)(model)
-        optimizer.update(grads)
+        optimizer.update(model, grads)
         
         # Forward pass after update
         loss_after = loss_fn(model)

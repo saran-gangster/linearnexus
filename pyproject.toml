@@ -21,7 +21,7 @@ classifiers = [
 dependencies = [
   "jax>=0.4.28",
   "jaxlib>=0.4.28",
-  "flax>=0.8.3",
+  "flax>=0.12.1,<0.12.3",
   "optax>=0.2.3",
   "numpy>=1.26.0",
 ]

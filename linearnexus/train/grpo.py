@@ -96,7 +96,7 @@ class GRPOTrainer:
         self.config = config
         
         # Initialize optimizer
-        self.opt_state = nnx.Optimizer(model, optimizer)
+        self.opt_state = nnx.Optimizer(model, optimizer, wrt=nnx.Param)
         
         self.step = 0
         self.metrics_history = []
@@ -368,7 +368,7 @@ class GRPOTrainer:
                 loss, grads = nnx.value_and_grad(loss_fn)(self.model)
                 
                 # Accumulate gradients
-                self.opt_state.update(grads)
+                self.opt_state.update(self.model, grads)
                 micro_losses.append(float(loss))
             
             # Compute metrics for this batch item

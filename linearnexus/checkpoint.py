@@ -362,7 +362,7 @@ def load_optimizer(
     if tx is None:
         tx = optax.adamw(learning_rate)
     
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     
     # Load saved state if exists
     opt_path = path / "optimizer.npz"
