@@ -22,11 +22,13 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from jax import profiler
 
 from linearnexus.modules.linear_attn.kda import kda_chunkwise, kda_recurrent
 
@@ -44,6 +46,9 @@ class BenchConfig:
     dtype: str
     use_qk_l2norm: bool
     seed: int
+    profile_dir: str | None
+    profile_steps: int
+    profile_which: str
 
 
 def _dtype_from_str(name: str) -> jnp.dtype:
@@ -147,6 +152,38 @@ def run_one_case(cfg: BenchConfig, *, key: jax.Array) -> None:
     print(f"chunkwise: {chk_avg*1e3:.3f} ms/iter | {tokens/chk_avg:,.0f} tokens/s")
     print(f"speedup (rec/chunk): {rec_avg/chk_avg:.2f}x")
 
+    # Optional profiler trace (TensorBoard-compatible)
+    if cfg.profile_dir is not None:
+        trace_dir = os.path.abspath(cfg.profile_dir)
+        os.makedirs(trace_dir, exist_ok=True)
+        steps = max(1, int(cfg.profile_steps))
+        which = cfg.profile_which
+        print(f"\n--- profiling ---")
+        print(f"trace_dir: {trace_dir}")
+        print(f"steps: {steps} | which: {which}")
+        print("Tip: open with `tensorboard --logdir <trace_dir>`")
+
+        def _profile_loop(name: str, fn):
+            # Warm one iteration to ensure executable is ready
+            _ = fn(q, k, v, g, beta)
+            # Start trace
+            profiler.start_trace(trace_dir)
+            for i in range(steps):
+                with profiler.StepTraceAnnotation(f"{name}_step", step_num=i):
+                    out = fn(q, k, v, g, beta)
+                    # block_until_ready to ensure step is captured
+                    if isinstance(out, tuple):
+                        out0 = out[0]
+                    else:
+                        out0 = out
+                    out0.block_until_ready()
+            profiler.stop_trace()
+
+        if which in ("recurrent", "both"):
+            _profile_loop("kda_recurrent", rec_jit)
+        if which in ("chunkwise", "both"):
+            _profile_loop("kda_chunkwise", chk_jit)
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
@@ -161,6 +198,25 @@ def main() -> None:
     p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--no-qk-l2norm", action="store_true", help="Disable q/k l2norm in kernel")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--profile-dir",
+        type=str,
+        default=None,
+        help="If set, write a short JAX profiler trace to this directory (view with TensorBoard).",
+    )
+    p.add_argument(
+        "--profile-steps",
+        type=int,
+        default=20,
+        help="Number of profiled iterations per kernel.",
+    )
+    p.add_argument(
+        "--profile-which",
+        type=str,
+        default="both",
+        choices=["recurrent", "chunkwise", "both"],
+        help="Which kernel(s) to profile.",
+    )
     args = p.parse_args()
 
     cfg = BenchConfig(
@@ -175,6 +231,9 @@ def main() -> None:
         dtype=args.dtype,
         use_qk_l2norm=not args.no_qk_l2norm,
         seed=args.seed,
+        profile_dir=args.profile_dir,
+        profile_steps=args.profile_steps,
+        profile_which=args.profile_which,
     )
 
     if cfg.seq_len <= 0 or cfg.key_dim <= 0 or cfg.value_dim <= 0:
