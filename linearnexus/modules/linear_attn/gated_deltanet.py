@@ -649,21 +649,15 @@ class GatedDeltaNetBlock(nnx.Module):
         # Apply gated delta rule
         scale = self.head_dim ** -0.5
         
-        if mode == "recurrent" or seq_len <= 64:
-            o, new_recurrent_state = gated_delta_rule_recurrent(
-                q, k, v, g, beta,
-                scale=scale,
-                initial_state=recurrent_state,
-                use_qk_l2norm=self.use_qk_l2norm,
-            )
-        else:
-            o, new_recurrent_state = gated_delta_rule_chunkwise(
-                q, k, v, g, beta,
-                scale=scale,
-                initial_state=recurrent_state,
-                chunk_size=64,
-                use_qk_l2norm=self.use_qk_l2norm,
-            )
+        # NOTE: Chunkwise mode has gradient instability issues with exp(cumsum(g))
+        # where g values are large negatives. Force recurrent mode for now.
+        # TODO: Implement numerically stable chunkwise algorithm
+        o, new_recurrent_state = gated_delta_rule_recurrent(
+            q, k, v, g, beta,
+            scale=scale,
+            initial_state=recurrent_state,
+            use_qk_l2norm=self.use_qk_l2norm,
+        )
 
         # Apply output gating
         if self.use_gate:
