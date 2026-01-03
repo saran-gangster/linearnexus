@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Debug script to isolate NaN in Gated DeltaNet."""
+"""Debug script to isolate NaN in Gated DeltaNet (including gradients)."""
 
 import sys
 from pathlib import Path
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
+import optax
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from linearnexus.models import ModelConfig, LMModel
+from linearnexus.train.base import cross_entropy_loss
 
 def check_nan(name, tensor, verbose=True):
     """Check if tensor has NaN/Inf and print debug info."""
@@ -26,18 +28,40 @@ def check_nan(name, tensor, verbose=True):
     
     return has_nan or has_inf
 
+
+def check_grads_for_nan(grads, prefix=""):
+    """Recursively check gradient dict for NaN."""
+    found_nan = False
+    
+    def _check(obj, path=""):
+        nonlocal found_nan
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _check(v, f"{path}.{k}" if path else k)
+        elif hasattr(obj, 'shape'):  # It's an array
+            has_nan = bool(jnp.any(jnp.isnan(obj)))
+            has_inf = bool(jnp.any(jnp.isinf(obj)))
+            if has_nan or has_inf:
+                found_nan = True
+                status = "❌ NaN" if has_nan else "❌ Inf"
+                print(f"  {prefix}{path}: {status} | shape={obj.shape}")
+    
+    _check(grads)
+    return found_nan
+
+
 def debug_gated_deltanet():
-    """Test gated_deltanet with debug output."""
+    """Test gated_deltanet with gradient computation."""
     
     print("=" * 60)
-    print("Gated DeltaNet NaN Debug")
+    print("Gated DeltaNet Gradient Debug")
     print("=" * 60)
     
     # Create config
     config = ModelConfig(
         vocab_size=65,
         hidden_size=256,
-        n_layers=2,  # Use fewer layers for debug
+        n_layers=2,
         block_pattern=["gated_deltanet"],
         gated_deltanet_heads=4,
         gated_deltanet_v_heads=4,
@@ -48,8 +72,6 @@ def debug_gated_deltanet():
     )
     
     print(f"\nConfig: hidden_size={config.hidden_size}, n_layers={config.n_layers}")
-    print(f"GatedDeltaNet: heads={config.gated_deltanet_heads}, v_heads={config.gated_deltanet_v_heads}")
-    print(f"head_dim={config.gated_deltanet_head_dim}, expand_v={config.gated_deltanet_expand_v}")
     
     # Create model
     print("\n--- Creating Model ---")
@@ -57,103 +79,79 @@ def debug_gated_deltanet():
     model = LMModel(config, rngs=rngs)
     print(f"Model params: {model.count_params():,}")
     
-    # Check model parameters for NaN
-    print("\n--- Checking Model Parameters ---")
-    for block_idx, block in enumerate(model.blocks):
-        if hasattr(block, 'A_log'):
-            check_nan(f"Block {block_idx} A_log", block.A_log.value)
-        if hasattr(block, 'dt_bias'):
-            check_nan(f"Block {block_idx} dt_bias", block.dt_bias.value)
-    
-    # Create dummy input
+    # Create batch
     batch_size, seq_len = 2, 64
     input_ids = jax.random.randint(jax.random.key(0), (batch_size, seq_len), 0, 65)
-    
-    print(f"\n--- Forward Pass (batch={batch_size}, seq_len={seq_len}) ---")
-    
-    # Get embedding
-    x = model.embed(input_ids)
-    check_nan("Embedding output", x)
-    
-    # Pass through each block
-    for block_idx, block in enumerate(model.blocks):
-        print(f"\n--- Block {block_idx} ---")
-        
-        # Store input for debugging
-        residual = x
-        check_nan(f"  Input to block", x)
-        
-        # Manually trace through GatedDeltaNetBlock
-        if hasattr(block, 'norm'):
-            x_norm = block.norm(x)
-            check_nan(f"  After norm", x_norm)
-        
-        if hasattr(block, 'q_proj'):
-            q = block.q_proj(x_norm)
-            check_nan(f"  q_proj", q)
-        
-        if hasattr(block, 'k_proj'):
-            k = block.k_proj(x_norm)
-            check_nan(f"  k_proj", k)
-            
-        if hasattr(block, 'v_proj'):
-            v = block.v_proj(x_norm)
-            check_nan(f"  v_proj", v)
-        
-        if hasattr(block, 'a_proj'):
-            a = block.a_proj(x_norm)
-            check_nan(f"  a_proj", a)
-            
-        if hasattr(block, 'b_proj'):
-            b = block.b_proj(x_norm)
-            check_nan(f"  b_proj", b)
-            beta = jax.nn.sigmoid(b)
-            check_nan(f"  beta=sigmoid(b)", beta)
-        
-        if hasattr(block, 'A_log') and hasattr(block, 'dt_bias'):
-            A_exp = jnp.exp(block.A_log[...])
-            check_nan(f"  exp(A_log)", A_exp)
-            
-            softplus_a = jax.nn.softplus(a + block.dt_bias[...])
-            check_nan(f"  softplus(a + dt_bias)", softplus_a)
-            
-            g = -A_exp * softplus_a
-            check_nan(f"  g (decay gate)", g)
-        
-        # Now run full block
-        try:
-            x, _ = block(residual)
-            check_nan(f"  Block output", x)
-        except Exception as e:
-            print(f"  ❌ Block forward failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-    
-    # Final output
-    print("\n--- Final Layers ---")
-    x = model.final_norm(x)
-    check_nan("After final_norm", x)
-    
-    logits = model.embed.unembed(x)
-    check_nan("Logits", logits)
-    
-    print("\n--- Computing Loss ---")
     labels = jax.random.randint(jax.random.key(1), (batch_size, seq_len), 0, 65)
+    batch = {"input_ids": input_ids, "labels": labels}
     
-    # Cross entropy loss
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    check_nan("Log probs", log_probs)
-    
-    one_hot = jax.nn.one_hot(labels, 65)
-    loss = -jnp.sum(one_hot * log_probs) / (batch_size * seq_len)
-    
-    print(f"\nFinal loss: {float(loss):.4f}")
+    print(f"\n--- Test Forward Pass ---")
+    logits, _ = model(input_ids)
+    loss = cross_entropy_loss(logits, labels)
+    print(f"Forward loss: {float(loss):.4f}")
     
     if jnp.isnan(loss) or jnp.isinf(loss):
-        print("\n❌ LOSS IS NaN/Inf!")
+        print("❌ Forward pass produces NaN/Inf loss!")
+        return
     else:
-        print("\n✓ Loss is finite!")
+        print("✓ Forward pass OK")
+    
+    # Split model for gradient computation
+    print("\n--- Testing Gradient Computation ---")
+    graphdef, params_state, rest_state = nnx.split(model, nnx.Param, ...)
+    params = nnx.to_pure_dict(params_state)
+    
+    # Define loss function
+    def loss_fn(params, batch, graphdef, params_state, rest_state):
+        nnx.replace_by_pure_dict(params_state, params)
+        merged_model = nnx.merge(graphdef, params_state, rest_state)
+        logits, _ = merged_model(batch["input_ids"])
+        return cross_entropy_loss(logits, batch["labels"])
+    
+    # Compute gradients
+    print("Computing gradients...")
+    try:
+        loss, grads = jax.value_and_grad(loss_fn)(params, batch, graphdef, params_state, rest_state)
+        print(f"Loss from grad computation: {float(loss):.4f}")
+        
+        # Check gradients for NaN
+        print("\n--- Checking Gradients for NaN ---")
+        has_nan_grads = check_grads_for_nan(grads)
+        
+        if has_nan_grads:
+            print("\n❌ GRADIENTS CONTAIN NaN/Inf!")
+        else:
+            print("\n✓ All gradients are finite!")
+            
+            # Try one optimization step
+            print("\n--- Testing Optimizer Step ---")
+            optimizer = optax.adamw(learning_rate=1e-4)
+            opt_state = optimizer.init(params)
+            updates, new_opt_state = optimizer.update(grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            
+            # Check new params for NaN
+            print("Checking updated params...")
+            has_nan_params = check_grads_for_nan(new_params, prefix="param: ")
+            
+            if has_nan_params:
+                print("\n❌ UPDATED PARAMS CONTAIN NaN!")
+            else:
+                print("\n✓ Updated params are finite!")
+                
+                # Compute loss with new params
+                loss2 = loss_fn(new_params, batch, graphdef, params_state, rest_state)
+                print(f"\nLoss after 1 step: {float(loss2):.4f}")
+                
+                if jnp.isnan(loss2) or jnp.isinf(loss2):
+                    print("❌ Loss became NaN/Inf after 1 step!")
+                else:
+                    print("✓ Training step successful!")
+        
+    except Exception as e:
+        print(f"❌ Gradient computation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
