@@ -358,24 +358,16 @@ def kda_chunkwise(
     chunk_size: int = 64,
     use_qk_l2norm: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Chunkwise parallel KDA with per-dimension gating.
+    """Chunkwise parallel KDA (faithful port of FLA's naive_chunk_kda).
 
-    Extends Gated DeltaNet chunkwise with per-dim cumulative gates.
+    This implements the same algorithm as:
+      [examples/fla/ops/kda/naive.py](examples/fla/ops/kda/naive.py)
 
-    Args:
-        q: Query [batch, num_v_heads, seq_len, key_dim]
-        k: Key [batch, num_v_heads, seq_len, key_dim]
-        v: Value [batch, num_v_heads, seq_len, value_dim]
-        g: Decay gate [batch, num_v_heads, seq_len, key_dim]
-        beta: Learning rate [batch, num_v_heads, seq_len]
-        scale: Query scaling factor
-        initial_state: Initial state [batch, num_v_heads, key_dim, value_dim]
-        chunk_size: Size of each chunk
-        use_qk_l2norm: Whether to L2-normalize Q and K
-
-    Returns:
-        output: [batch, num_v_heads, seq_len, value_dim]
-        final_state: [batch, num_v_heads, key_dim, value_dim]
+    Notes:
+    - This is a correctness-oriented implementation (uses O(BT^3) work per chunk).
+    - Internally computes in float32 for stability.
+    - Expects g to be per-token log-decay (typically negative); the kernel uses
+      cumulative sums of g within each chunk.
     """
     batch, num_v_heads, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
@@ -383,14 +375,17 @@ def kda_chunkwise(
     if scale is None:
         scale = key_dim ** -0.5
 
-    # L2 normalize Q and K if requested
+    # L2 normalize Q and K if requested (matches FLA's optional in-kernel l2norm)
     if use_qk_l2norm:
         q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
         k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
 
+    # Scale queries (matches reference)
+    q = q * scale
+
     # Pad to multiple of chunk_size
-    pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
-    if pad_len > 0:
+    pad_len = (chunk_size - (seq_len % chunk_size)) % chunk_size
+    if pad_len:
         q = jnp.pad(q, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
         k = jnp.pad(k, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad_len), (0, 0)))
@@ -399,144 +394,202 @@ def kda_chunkwise(
 
     padded_len = q.shape[2]
     num_chunks = padded_len // chunk_size
+    BT = chunk_size
 
-    # Reshape: [batch, heads, num_chunks, chunk_size, dim]
-    q_chunks = q.reshape(batch, num_v_heads, num_chunks, chunk_size, key_dim)
-    k_chunks = k.reshape(batch, num_v_heads, num_chunks, chunk_size, key_dim)
-    v_chunks = v.reshape(batch, num_v_heads, num_chunks, chunk_size, value_dim)
-    g_chunks = g.reshape(batch, num_v_heads, num_chunks, chunk_size, key_dim)
-    beta_chunks = beta.reshape(batch, num_v_heads, num_chunks, chunk_size)
+    # Reshape to chunks: [B, H, N, BT, ...]
+    q = q.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
+    k = k.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
+    v = v.reshape(batch, num_v_heads, num_chunks, BT, value_dim)
+    g = g.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
+    beta = beta.reshape(batch, num_v_heads, num_chunks, BT)
 
-    # Initialize state
+    # Compute in float32
+    q = q.astype(jnp.float32)
+    k = k.astype(jnp.float32)
+    v = v.astype(jnp.float32)
+    g = g.astype(jnp.float32)
+    beta = beta.astype(jnp.float32)
+
+    # Cumulative gates within each chunk: g <- cumsum(g)
+    g = jnp.cumsum(g, axis=3)  # [B, H, N, BT, K]
+
+    # ---------------------------------------------------------------------
+    # Precompute Aqk and A (called Akk in FLA) per chunk.
+    #
+    # FLA Triton intra-chunk kernels avoid materializing [BT, BT, K] and avoid
+    # overflow by using a blockwise factorization with a per-row-block gate
+    # reference g_ref:
+    #   exp(g_row - g_col) = exp(g_row - g_ref) * exp(g_ref - g_col)
+    # For causal pairs (row >= col) and chunk-local cumsum gates, both
+    # differences are <= 0, so the exponentials are in (0, 1] and never
+    # overflow.
+    # ---------------------------------------------------------------------
+    exp_g = jnp.exp(g)  # [B, H, N, BT, K] (safe: g is typically <= 0)
+
+    # Tile within each chunk (BC=16 as in FLA kernels)
+    BC = 16
+    if BT % BC != 0:
+        raise ValueError(f"chunk_size (BT={BT}) must be divisible by BC={BC}.")
+    NC = BT // BC
+
+    # Masks within a BCxBC tile
+    tril_inclusive = jnp.tril(jnp.ones((BC, BC), dtype=bool), k=0)
+    tril_strict = jnp.tril(jnp.ones((BC, BC), dtype=bool), k=-1)
+
+    def _exp_leq0(x: jax.Array) -> jax.Array:
+        return jnp.exp(jnp.minimum(x, 0.0)).astype(jnp.float32)
+
+    def build_matrices_for_chunk(q_chunk, k_chunk, g_chunk, beta_chunk):
+        # Inputs: [B, H, N, BT, K] (or beta [B,H,N,BT])
+        B_, H_, N_, _, K_ = q_chunk.shape
+        zeros_block = jnp.zeros((B_, H_, N_, BC, BC), dtype=jnp.float32)
+
+        A0_rows = []
+        Aqk_rows = []
+        for i in range(NC):
+            r0, r1 = i * BC, (i + 1) * BC
+            g_rows = g_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
+            q_rows = q_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
+            k_rows = k_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
+            beta_rows = beta_chunk[:, :, :, r0:r1]  # [B,H,N,BC]
+
+            # Diagonal block (i == j): exp(g_r - g_c) with r>=c is safe (<=0)
+            exp_rel_diag = _exp_leq0(g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :])
+            A0_diag = jnp.sum(
+                (k_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
+                axis=-1,
+            )
+            Aqk_diag = jnp.sum(
+                (q_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
+                axis=-1,
+            )
+            # Apply beta row-wise to A0 (strictly lower triangle only)
+            A0_diag = A0_diag * beta_rows[:, :, :, :, None]
+            A0_diag = jnp.where(tril_strict[None, None, None, :, :], A0_diag, 0.0)
+            # Aqk is causal inclusive (lower triangle including diagonal)
+            Aqk_diag = jnp.where(tril_inclusive[None, None, None, :, :], Aqk_diag, 0.0)
+
+            row_blocks_A0 = []
+            row_blocks_Aqk = []
+            for j in range(NC):
+                if j < i:
+                    c0, c1 = j * BC, (j + 1) * BC
+                    g_cols = g_chunk[:, :, :, c0:c1, :]  # [B,H,N,BC,K]
+                    k_cols = k_chunk[:, :, :, c0:c1, :]  # [B,H,N,BC,K]
+
+                    # Reference gate at the start of the row block
+                    g_ref = g_chunk[:, :, :, r0, :]  # [B,H,N,K]
+
+                    # Both factors are <= 1 for causal blocks (j<i)
+                    row_scale = _exp_leq0(g_rows - g_ref[:, :, :, None, :])
+                    col_scale = _exp_leq0(g_ref[:, :, :, None, :] - g_cols)
+
+                    k_row_scaled = k_rows * row_scale
+                    k_col_scaled = k_cols * col_scale
+                    q_row_scaled = q_rows * row_scale
+
+                    A0_blk = jnp.matmul(k_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+                    A0_blk = A0_blk * beta_rows[:, :, :, :, None]
+                    Aqk_blk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+
+                    row_blocks_A0.append(A0_blk)
+                    row_blocks_Aqk.append(Aqk_blk)
+                elif j == i:
+                    row_blocks_A0.append(A0_diag)
+                    row_blocks_Aqk.append(Aqk_diag)
+                else:
+                    row_blocks_A0.append(zeros_block)
+                    row_blocks_Aqk.append(zeros_block)
+
+            A0_rows.append(jnp.concatenate(row_blocks_A0, axis=-1))
+            Aqk_rows.append(jnp.concatenate(row_blocks_Aqk, axis=-1))
+
+        A0_full = jnp.concatenate(A0_rows, axis=-2)   # [B,H,N,BT,BT]
+        Aqk_full = jnp.concatenate(Aqk_rows, axis=-2)  # [B,H,N,BT,BT]
+        return A0_full, Aqk_full
+
+    A0, Aqk = build_matrices_for_chunk(q, k, g, beta)
+
+    # Multiply by beta (row-wise): A0 *= beta[row]
+    # (Already applied in the blockwise construction)
+
+    # Mask diagonal and upper triangle, then negate: L = -A0 where col < row else 0
+    diag_upper = jnp.triu(jnp.ones((BT, BT), dtype=bool), k=0)
+    L = -jnp.where(diag_upper[None, None, None, :, :], 0.0, A0)
+
+    # Compute A = (I - L)^{-1} @ diag(beta) via one triangular solve.
+    I = jnp.eye(BT, dtype=jnp.float32)[None, None, None, :, :]
+    M = I - L  # lower-triangular with unit diagonal
+    diag_beta = I * beta[:, :, :, None, :]  # diag(beta)
+    A = jax.lax.linalg.triangular_solve(M, diag_beta, left_side=True, lower=True)
+
+    # w = A @ (exp(g) * k), u = A @ v
+    w = jnp.matmul(A, k * exp_g)  # [B, H, N, BT, K]
+    u = jnp.matmul(A, v)      # [B, H, N, BT, V]
+
+    # ---------------------------------------------------------------------
+    # Chunk scan: update recurrent state and produce outputs.
+    # ---------------------------------------------------------------------
     if initial_state is None:
-        S = jnp.zeros((batch, num_v_heads, key_dim, value_dim), dtype=jnp.float32)
+        S0 = jnp.zeros((batch, num_v_heads, key_dim, value_dim), dtype=jnp.float32)
     else:
-        S = initial_state.astype(jnp.float32)
+        S0 = initial_state.astype(jnp.float32)
 
-    def process_chunk(S, chunk_inputs):
-        """Process one chunk with KDA per-dim gating."""
-        q_c, k_c, v_c, g_c, beta_c = chunk_inputs
-        # q_c, k_c: [batch, heads, L, key_dim]
-        # v_c: [batch, heads, L, value_dim]
-        # g_c: [batch, heads, L, key_dim]
-        # beta_c: [batch, heads, L]
-        L = chunk_size
+    strict_upper = jnp.triu(jnp.ones((BT, BT), dtype=bool), k=1)
 
-        # Cast to float32
-        q_c = q_c.astype(jnp.float32)
-        k_c = k_c.astype(jnp.float32)
-        v_c = v_c.astype(jnp.float32)
-        g_c = g_c.astype(jnp.float32)
-        beta_c = beta_c.astype(jnp.float32)
+    def step(S, inputs):
+        q_i, k_i, u_i, g_i, w_i, Aqk_i = inputs
+        # Shapes:
+        # q_i: [B, H, BT, K]
+        # k_i: [B, H, BT, K]
+        # u_i: [B, H, BT, V]
+        # g_i: [B, H, BT, K] (cumulative)
+        # w_i: [B, H, BT, K]
 
-        # Compute cumulative gates within chunk (per-dim)
-        # g_cum[i] = sum(g[0:i+1]) for positions 0 to i
-        g_cum = jnp.cumsum(g_c, axis=-2)  # [batch, heads, L, key_dim]
+        # Interactions within chunk (precomputed, causal masked)
+        Aqk_i = jnp.where(strict_upper[None, None, :, :], 0.0, Aqk_i)
 
-        # Total chunk decay (for state update)
-        g_total = g_cum[:, :, -1, :]  # [batch, heads, key_dim]
+        # q_pos is only needed for the inter-chunk term; exp(g) is safe (<= 1)
+        q_pos = q_i * jnp.exp(g_i)
 
-        # Build intra-chunk attention with per-dim relative gates
-        # For position i affecting position j (j > i):
-        # Relative decay per dim: exp(g_cum[j] - g_cum[i])
+        # v_i = u_i - w_i @ S
+        WS = jnp.einsum("bhck,bhkv->bhcv", w_i, S)
+        v_i = u_i - WS
 
-        # Compute pairwise relative gates
-        # g_cum_i: [batch, heads, L, 1, key_dim]
-        # g_cum_j: [batch, heads, 1, L, key_dim]
-        g_cum_i = g_cum[:, :, :, None, :]
-        g_cum_j = g_cum[:, :, None, :, :]
-        # relative_gate: [batch, heads, L, L, key_dim]
-        relative_gate = jnp.exp(g_cum_j - g_cum_i)
+        # o = (q_i * exp(g_i)) @ S + Aqk @ v_i
+        o_inter = jnp.einsum("bhck,bhkv->bhcv", q_pos, S)
+        o_intra = jnp.einsum("bhij,bhjv->bhiv", Aqk_i, v_i)
+        o = o_inter + o_intra
 
-        # K @ K^T with per-dim gating (contract over key_dim)
-        # kk[i,j] = sum_d(k[i,d] * k[j,d] * relative_gate[i,j,d])
-        k_i = k_c[:, :, :, None, :]  # [batch, heads, L, 1, key_dim]
-        k_j = k_c[:, :, None, :, :]  # [batch, heads, 1, L, key_dim]
-        kk_gated = jnp.sum(k_i * k_j * relative_gate, axis=-1)  # [batch, heads, L, L]
+        # State update
+        g_last = g_i[:, :, -1, :]  # [B, H, K]
+        S_new = S * jnp.exp(g_last)[..., None]
 
-        # Apply lower triangular mask (exclude diagonal for Akk)
-        mask_lower = jnp.tril(jnp.ones((L, L)), k=-1)
-        M = kk_gated * mask_lower
+        kg_update = jnp.exp(g_last[:, :, None, :] - g_i) * k_i  # [B, H, BT, K]
+        S_new = S_new + jnp.einsum(
+            "bhkc,bhcv->bhkv",
+            jnp.transpose(kg_update, (0, 1, 3, 2)),
+            v_i,
+        )
 
-        # A = I + diag(beta) @ M
-        A = jnp.eye(L) + beta_c[..., None] * M
+        return S_new, o
 
-        # Solve A @ T = diag(beta) for T
-        diag_beta = jnp.eye(L) * beta_c[..., None]
-        T = jax.lax.linalg.triangular_solve(A, diag_beta, left_side=True, lower=True)
+    # Scan over chunks (N axis)
+    q_scan = jnp.transpose(q, (2, 0, 1, 3, 4))
+    k_scan = jnp.transpose(k, (2, 0, 1, 3, 4))
+    u_scan = jnp.transpose(u, (2, 0, 1, 3, 4))
+    g_scan = jnp.transpose(g, (2, 0, 1, 3, 4))
+    w_scan = jnp.transpose(w, (2, 0, 1, 3, 4))
+    Aqk_scan = jnp.transpose(Aqk, (2, 0, 1, 3, 4))
 
-        # Compute W = T @ (K * exp(g_cum)) and U = T @ (V * exp(g_cum))
-        # Need per-dim gated K
-        g_cum_exp = jnp.exp(g_cum)  # [batch, heads, L, key_dim]
-        k_gated = k_c * g_cum_exp  # [batch, heads, L, key_dim]
+    final_state, o_chunks = lax.scan(step, S0, (q_scan, k_scan, u_scan, g_scan, w_scan, Aqk_scan))
 
-        # For v_gated, we need scalar gate (sum over key_dim or use first?)
-        # Actually from FLA, V uses the same gating structure
-        # Let's use mean of g_cum over key_dim for value gating
-        g_cum_mean = jnp.mean(g_cum, axis=-1, keepdims=True)  # [batch, heads, L, 1]
-        v_gated = v_c * jnp.exp(g_cum_mean)  # [batch, heads, L, value_dim]
+    # Reassemble outputs: [N, B, H, BT, V] -> [B, H, N*BT, V]
+    o_chunks = jnp.transpose(o_chunks, (1, 2, 0, 3, 4)).reshape(batch, num_v_heads, padded_len, value_dim)
+    if pad_len:
+        o_chunks = o_chunks[:, :, :seq_len, :]
 
-        # W = T @ k_gated: [batch, heads, L, key_dim]
-        W = jnp.einsum("bhij,bhjk->bhik", T, k_gated)
-        # U = T @ v_gated: [batch, heads, L, value_dim]
-        U = jnp.einsum("bhij,bhjv->bhiv", T, v_gated)
-
-        # Inter-chunk: decay state and compute Q @ S_decayed
-        # Need position-wise decay
-        # O_inter[i] = q[i] @ S * exp(g_cum[i])
-        # But g is per-dim, so we need to handle this carefully
-        # q @ S gives [batch, heads, L, value_dim]
-        # Scale by exp(mean(g_cum)) for simplicity
-        O_inter = jnp.einsum("bhik,bhkv->bhiv", q_c, S) * jnp.exp(g_cum_mean) * scale
-
-        # Intra-chunk correction: U - W @ S
-        WS = jnp.einsum("bhik,bhkv->bhiv", W, S)
-        correction = U - WS
-
-        # Intra-chunk: (Q @ K^T * mask * gates) @ correction
-        # Use per-dim gates for QK^T
-        q_i = q_c[:, :, :, None, :]  # [batch, heads, L, 1, key_dim]
-        qk_gated = jnp.sum(q_i * k_j * relative_gate, axis=-1)  # [batch, heads, L, L]
-
-        # Apply causal mask (include diagonal for Aqk unlike Akk)
-        causal_mask = jnp.tril(jnp.ones((L, L)))
-        qk_masked = qk_gated * causal_mask * scale
-
-        O_intra = jnp.einsum("bhij,bhjv->bhiv", qk_masked, correction)
-
-        O_chunk = O_inter + O_intra
-
-        # State update: S_new = S * exp(g_total) + k_gated^T @ correction
-        # g_total: [batch, heads, key_dim]
-        S_new = S * jnp.exp(g_total)[..., None]  # [batch, heads, key_dim, value_dim]
-        # k_gated: [batch, heads, L, key_dim]
-        # correction: [batch, heads, L, value_dim]
-        S_new = S_new + jnp.einsum("bhik,bhiv->bhkv", k_gated, correction)
-
-        return S_new, O_chunk
-
-    # Process chunks
-    final_state, outputs = lax.scan(
-        process_chunk,
-        S,
-        (
-            jnp.transpose(q_chunks, (2, 0, 1, 3, 4)),
-            jnp.transpose(k_chunks, (2, 0, 1, 3, 4)),
-            jnp.transpose(v_chunks, (2, 0, 1, 3, 4)),
-            jnp.transpose(g_chunks, (2, 0, 1, 3, 4)),
-            jnp.transpose(beta_chunks, (2, 0, 1, 3)),
-        ),
-    )
-
-    # Reshape output
-    output = jnp.transpose(outputs, (1, 2, 0, 3, 4))
-    output = output.reshape(batch, num_v_heads, padded_len, value_dim)
-
-    # Remove padding
-    if pad_len > 0:
-        output = output[:, :, :seq_len, :]
-
-    return output.astype(q.dtype), final_state
+    return o_chunks.astype(v.dtype), final_state
 
 
 # =============================================================================
@@ -810,10 +863,11 @@ class KDABlock(nnx.Module):
         # Get recurrent state
         recurrent_state = state.S if state is not None else None
 
-        # Select mode - default to recurrent since chunkwise for per-dim gates is complex
-        # and our reference implementation has numerical issues
-        use_recurrent = mode == "recurrent" or mode is None or seq_len == 1
-        if use_recurrent:
+        # Mode selection (match project convention: chunk for training, recurrent for generation)
+        if mode is None:
+            mode = "recurrent" if seq_len == 1 else "chunk"
+
+        if mode == "recurrent" or seq_len == 1:
             if seq_len == 1:
                 # Single step
                 o, new_recurrent_state = kda_step(

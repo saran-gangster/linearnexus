@@ -248,6 +248,46 @@ class TestKDAKernels:
         
         assert jnp.allclose(out_step, out_rec[:, :, 0, :], rtol=1e-4, atol=1e-4)
         assert jnp.allclose(state_step, state_rec, rtol=1e-4, atol=1e-4)
+
+    def test_chunkwise_matches_recurrent(self, key):
+        """Chunkwise kernel should match recurrent kernel (correctness target).
+
+        Uses a single chunk (seq_len=64) to avoid padding edge-cases.
+        """
+        batch = 2
+        heads = 2
+        seq_len = 64
+        key_dim = 8
+        value_dim = 8
+
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+        q = jax.random.normal(k1, (batch, heads, seq_len, key_dim))
+        k = jax.random.normal(k2, (batch, heads, seq_len, key_dim))
+        v = jax.random.normal(k3, (batch, heads, seq_len, value_dim))
+
+        # Negative log-decay gates (so exp(g) in (0, 1])
+        g = -jax.random.uniform(k4, (batch, heads, seq_len, key_dim), minval=0.0, maxval=0.5)
+        beta = jax.random.uniform(k5, (batch, heads, seq_len), minval=0.0, maxval=1.0)
+
+        out_rec, st_rec = kda_recurrent(q, k, v, g, beta, use_qk_l2norm=True)
+        out_chunk, st_chunk = kda_chunkwise(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            chunk_size=64,
+            use_qk_l2norm=True,
+        )
+
+        assert out_chunk.shape == out_rec.shape
+        assert st_chunk.shape == st_rec.shape
+
+        # Chunkwise and recurrent should be close (float32 internal math)
+        assert jnp.all(jnp.isfinite(out_chunk))
+        assert jnp.all(jnp.isfinite(st_chunk))
+        assert jnp.allclose(out_chunk, out_rec, rtol=2e-3, atol=2e-3)
+        assert jnp.allclose(st_chunk, st_rec, rtol=2e-3, atol=2e-3)
     
     def test_chunkwise_output_shape(self, key, small_dims):
         """Test chunkwise kernel output shape."""
