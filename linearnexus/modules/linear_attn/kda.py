@@ -396,12 +396,19 @@ def kda_chunkwise(
     num_chunks = padded_len // chunk_size
     BT = chunk_size
 
-    # Reshape to chunks: [B, H, N, BT, ...]
+    # Canonical layout: chunk-major [N, B, H, BT, ...]
+    # This avoids repeated transposes when feeding lax.scan over chunks.
     q = q.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
     k = k.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
     v = v.reshape(batch, num_v_heads, num_chunks, BT, value_dim)
     g = g.reshape(batch, num_v_heads, num_chunks, BT, key_dim)
     beta = beta.reshape(batch, num_v_heads, num_chunks, BT)
+
+    q = jnp.transpose(q, (2, 0, 1, 3, 4))
+    k = jnp.transpose(k, (2, 0, 1, 3, 4))
+    v = jnp.transpose(v, (2, 0, 1, 3, 4))
+    g = jnp.transpose(g, (2, 0, 1, 3, 4))
+    beta = jnp.transpose(beta, (2, 0, 1, 3))
 
     # Compute in float32
     q = q.astype(jnp.float32)
@@ -412,7 +419,7 @@ def kda_chunkwise(
 
     # Cumulative gates within each chunk: g <- cumsum(g)
     # Prefer cumsum to avoid associative_scan lowering IR bloat.
-    g = lax.cumsum(g, axis=3)  # [B, H, N, BT, K]
+    g = lax.cumsum(g, axis=3)  # [N, B, H, BT, K]
 
     # ---------------------------------------------------------------------
     # Precompute Aqk and A (called Akk in FLA) per chunk.
@@ -425,7 +432,7 @@ def kda_chunkwise(
     # differences are <= 0, so the exponentials are in (0, 1] and never
     # overflow.
     # ---------------------------------------------------------------------
-    exp_g = jnp.exp(g)  # [B, H, N, BT, K] (safe: g is typically <= 0)
+    exp_g = jnp.exp(g)  # [N, B, H, BT, K] (safe: g is typically <= 0)
 
     # Tile within each chunk (BC=16 as in FLA kernels)
     BC = 16
@@ -457,21 +464,21 @@ def kda_chunkwise(
         """Build M (unit lower-triangular) and Aqk for all chunks.
 
         Shapes:
-            q_all, k_all, g_all: [B, H, N, BT, K]
-            beta_all: [B, H, N, BT]
+            q_all, k_all, g_all: [N, B, H, BT, K]
+            beta_all: [N, B, H, BT]
             Returns:
-                M:   [B, H, N, BT, BT]
-                Aqk: [B, H, N, BT, BT]
+                M:   [N, B, H, BT, BT]
+                Aqk: [N, B, H, BT, BT]
 
         Uses lax.fori_loop over BC blocks (no Python unrolling) while keeping
         chunks (N) batched for GPU parallelism.
         """
         # Build blockwise tensors and reshape once at the end.
         # This avoids repeated dynamic_update_slice into huge [BT, BT] buffers.
-        B_, H_, N_, _, K_ = q_all.shape
+        N_, B_, H_, _, K_ = q_all.shape
 
         eye_bc = jnp.eye(BC, dtype=jnp.float32)[None, None, None, :, :]
-        zeros_bc = jnp.zeros((B_, H_, N_, BC, BC), dtype=jnp.float32)
+        zeros_bc = jnp.zeros((N_, B_, H_, BC, BC), dtype=jnp.float32)
 
         def diag_block(
             g_rows: jax.Array,
@@ -523,7 +530,7 @@ def kda_chunkwise(
             q_rows = q_all[:, :, :, r0 : r0 + BC, :]
             k_rows = k_all[:, :, :, r0 : r0 + BC, :]
             beta_rows = beta_all[:, :, :, r0 : r0 + BC]
-            g_ref = g_all[:, :, :, r0, :]  # [B, H, N, K]
+            g_ref = g_all[:, :, :, r0, :]  # [N, B, H, K]
 
             m_blocks = []
             aqk_blocks = []
@@ -559,8 +566,8 @@ def kda_chunkwise(
     M, Aqk = build_m_and_aqk(q, k, g, beta)
 
     # Packed RHS triangular solve for all chunks (keeps N batched; avoids materializing A).
-    rhs_w = beta[..., None] * (k * exp_g)  # [B, H, N, BT, K]
-    rhs_u = beta[..., None] * v            # [B, H, N, BT, V]
+    rhs_w = beta[..., None] * (k * exp_g)  # [N, B, H, BT, K]
+    rhs_u = beta[..., None] * v            # [N, B, H, BT, V]
     rhs = jnp.concatenate([rhs_w, rhs_u], axis=-1)
     solved = jax.lax.linalg.triangular_solve(
         M,
@@ -615,16 +622,8 @@ def kda_chunkwise(
 
         return S_new, o
 
-    # Scan over chunks (N axis)
-    q_scan = jnp.transpose(q, (2, 0, 1, 3, 4))
-    k_scan = jnp.transpose(k, (2, 0, 1, 3, 4))
-    u_scan = jnp.transpose(u, (2, 0, 1, 3, 4))
-    g_scan = jnp.transpose(g, (2, 0, 1, 3, 4))
-    w_scan = jnp.transpose(w, (2, 0, 1, 3, 4))
-    Aqk_scan = jnp.transpose(Aqk, (2, 0, 1, 3, 4))
-    exp_g_scan = jnp.transpose(exp_g, (2, 0, 1, 3, 4))
-
-    final_state, o_chunks = lax.scan(step, S0, (q_scan, k_scan, u_scan, g_scan, w_scan, Aqk_scan, exp_g_scan))
+    # Scan over chunks (N axis) with canonical layout: inputs are already [N, B, H, ...]
+    final_state, o_chunks = lax.scan(step, S0, (q, k, u, g, w, Aqk, exp_g))
 
     # Reassemble outputs: [N, B, H, BT, V] -> [B, H, N*BT, V]
     o_chunks = jnp.transpose(o_chunks, (1, 2, 0, 3, 4)).reshape(batch, num_v_heads, padded_len, value_dim)
