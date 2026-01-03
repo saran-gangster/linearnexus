@@ -504,9 +504,10 @@ class GatedDeltaNetBlock(nnx.Module):
         # Decay parameters (a_proj + A_log + dt_bias)
         self.a_proj = nnx.Linear(hidden_size, self.num_v_heads, use_bias=False, rngs=rngs)
         
-        # Initialize A_log uniform in [0, 16], store log for stability
+        # Initialize A_log uniform in [1e-4, 16], store log for stability
+        # Note: minval must be > 0 to avoid log(0) = -inf
         key = rngs.params()
-        A = jax.random.uniform(key, (self.num_v_heads,), minval=0.0, maxval=16.0)
+        A = jax.random.uniform(key, (self.num_v_heads,), minval=1e-4, maxval=16.0)
         self.A_log = nnx.Param(jnp.log(A))
 
         # Initialize dt_bias using Mamba2's scheme
