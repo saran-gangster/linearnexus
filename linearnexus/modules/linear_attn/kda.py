@@ -466,69 +466,94 @@ def kda_chunkwise(
         Uses lax.fori_loop over BC blocks (no Python unrolling) while keeping
         chunks (N) batched for GPU parallelism.
         """
+        # Build blockwise tensors and reshape once at the end.
+        # This avoids repeated dynamic_update_slice into huge [BT, BT] buffers.
         B_, H_, N_, _, K_ = q_all.shape
 
-        I = jnp.eye(BT, dtype=jnp.float32)[None, None, None, :, :]
-        M_full = jnp.broadcast_to(I, (B_, H_, N_, BT, BT))
-        Aqk_full = jnp.zeros((B_, H_, N_, BT, BT), dtype=jnp.float32)
-
         eye_bc = jnp.eye(BC, dtype=jnp.float32)[None, None, None, :, :]
+        zeros_bc = jnp.zeros((B_, H_, N_, BC, BC), dtype=jnp.float32)
 
-        def compute_row_block(i, outputs):
-            M_acc, Aqk_acc = outputs
-            r0 = i * BC
+        def diag_block(
+            g_rows: jax.Array,
+            q_rows: jax.Array,
+            k_rows: jax.Array,
+            beta_rows: jax.Array,
+        ) -> Tuple[jax.Array, jax.Array]:
+            d = g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :]
+            exp_rel_strict = _masked_exp(d, tril_strict[None, None, None, :, :, None])
+            exp_rel_incl = _masked_exp(d, tril_inclusive[None, None, None, :, :, None])
 
-            g_rows = lax.dynamic_slice(g_all, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
-            q_rows = lax.dynamic_slice(q_all, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
-            k_rows = lax.dynamic_slice(k_all, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
-            beta_rows = lax.dynamic_slice(beta_all, (0, 0, 0, r0), (B_, H_, N_, BC))
-            g_ref = lax.dynamic_slice(g_all, (0, 0, 0, r0, 0), (B_, H_, N_, 1, K_))[:, :, :, 0, :]
-
-            d_diag = g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :]
-            exp_rel_strict = _masked_exp(d_diag, tril_strict[None, None, None, :, :, None])
-            exp_rel_incl = _masked_exp(d_diag, tril_inclusive[None, None, None, :, :, None])
-
-            A0_diag = jnp.sum(
+            A0 = jnp.sum(
                 (k_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_strict,
                 axis=-1,
             )
-            Aqk_diag = jnp.sum(
+            Aqk = jnp.sum(
                 (q_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_incl,
                 axis=-1,
             )
+            A0 = A0 * beta_rows[:, :, :, :, None]
+            return eye_bc + A0, Aqk
 
-            A0_diag = A0_diag * beta_rows[:, :, :, :, None]
+        def offdiag_block(
+            g_rows: jax.Array,
+            q_rows: jax.Array,
+            k_rows: jax.Array,
+            beta_rows: jax.Array,
+            g_cols: jax.Array,
+            k_cols: jax.Array,
+            g_ref: jax.Array,
+        ) -> Tuple[jax.Array, jax.Array]:
+            row_scale = _exp_leq0(g_rows - g_ref[:, :, :, None, :])
+            col_scale = _exp_leq0(g_ref[:, :, :, None, :] - g_cols)
 
-            M_diag_blk = eye_bc + A0_diag
-            M_acc = lax.dynamic_update_slice(M_acc, M_diag_blk, (0, 0, 0, r0, r0))
-            Aqk_acc = lax.dynamic_update_slice(Aqk_acc, Aqk_diag, (0, 0, 0, r0, r0))
+            k_row_scaled = k_rows * row_scale
+            k_col_scaled = k_cols * col_scale
+            q_row_scaled = q_rows * row_scale
 
-            def compute_col_block(j, inner_outputs):
-                M_inner, Aqk_inner = inner_outputs
-                c0 = j * BC
+            A0 = jnp.matmul(k_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+            A0 = A0 * beta_rows[:, :, :, :, None]
+            Aqk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+            return A0, Aqk
 
-                g_cols = lax.dynamic_slice(g_all, (0, 0, 0, c0, 0), (B_, H_, N_, BC, K_))
-                k_cols = lax.dynamic_slice(k_all, (0, 0, 0, c0, 0), (B_, H_, N_, BC, K_))
+        m_rows = []
+        aqk_rows = []
+        for i in range(NC):
+            r0 = i * BC
+            g_rows = g_all[:, :, :, r0 : r0 + BC, :]
+            q_rows = q_all[:, :, :, r0 : r0 + BC, :]
+            k_rows = k_all[:, :, :, r0 : r0 + BC, :]
+            beta_rows = beta_all[:, :, :, r0 : r0 + BC]
+            g_ref = g_all[:, :, :, r0, :]  # [B, H, N, K]
 
-                row_scale = _exp_leq0(g_rows - g_ref[:, :, :, None, :])
-                col_scale = _exp_leq0(g_ref[:, :, :, None, :] - g_cols)
+            m_blocks = []
+            aqk_blocks = []
+            for j in range(NC):
+                if j == i:
+                    m_blk, aqk_blk = diag_block(g_rows, q_rows, k_rows, beta_rows)
+                elif j < i:
+                    c0 = j * BC
+                    g_cols = g_all[:, :, :, c0 : c0 + BC, :]
+                    k_cols = k_all[:, :, :, c0 : c0 + BC, :]
+                    m_blk, aqk_blk = offdiag_block(
+                        g_rows,
+                        q_rows,
+                        k_rows,
+                        beta_rows,
+                        g_cols,
+                        k_cols,
+                        g_ref,
+                    )
+                else:
+                    m_blk, aqk_blk = zeros_bc, zeros_bc
 
-                k_row_scaled = k_rows * row_scale
-                k_col_scaled = k_cols * col_scale
-                q_row_scaled = q_rows * row_scale
+                m_blocks.append(m_blk)
+                aqk_blocks.append(aqk_blk)
 
-                A0_blk = jnp.matmul(k_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
-                A0_blk = A0_blk * beta_rows[:, :, :, :, None]
-                Aqk_blk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+            m_rows.append(jnp.concatenate(m_blocks, axis=-1))
+            aqk_rows.append(jnp.concatenate(aqk_blocks, axis=-1))
 
-                M_inner = lax.dynamic_update_slice(M_inner, A0_blk, (0, 0, 0, r0, c0))
-                Aqk_inner = lax.dynamic_update_slice(Aqk_inner, Aqk_blk, (0, 0, 0, r0, c0))
-                return (M_inner, Aqk_inner)
-
-            M_acc, Aqk_acc = lax.fori_loop(0, i, compute_col_block, (M_acc, Aqk_acc))
-            return (M_acc, Aqk_acc)
-
-        M_full, Aqk_full = lax.fori_loop(0, NC, compute_row_block, (M_full, Aqk_full))
+        M_full = jnp.concatenate(m_rows, axis=-2)
+        Aqk_full = jnp.concatenate(aqk_rows, axis=-2)
         return M_full, Aqk_full
 
     M, Aqk = build_m_and_aqk(q, k, g, beta)
