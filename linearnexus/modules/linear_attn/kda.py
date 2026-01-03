@@ -411,7 +411,8 @@ def kda_chunkwise(
     beta = beta.astype(jnp.float32)
 
     # Cumulative gates within each chunk: g <- cumsum(g)
-    g = jnp.cumsum(g, axis=3)  # [B, H, N, BT, K]
+    # Use associative_scan for parallel prefix sum (better GPU utilization)
+    g = jax.lax.associative_scan(jnp.add, g, axis=3)  # [B, H, N, BT, K]
 
     # ---------------------------------------------------------------------
     # Precompute Aqk and A (called Akk in FLA) per chunk.
@@ -440,20 +441,31 @@ def kda_chunkwise(
         return jnp.exp(jnp.minimum(x, 0.0)).astype(jnp.float32)
 
     def build_matrices_for_chunk(q_chunk, k_chunk, g_chunk, beta_chunk):
-        # Inputs: [B, H, N, BT, K] (or beta [B,H,N,BT])
+        """Build A0 and Aqk matrices using lax.fori_loop to prevent unrolling.
+        
+        This avoids XLA unrolling the nested loops which causes massive IR bloat
+        and slow compile times.
+        """
         B_, H_, N_, _, K_ = q_chunk.shape
-        zeros_block = jnp.zeros((B_, H_, N_, BC, BC), dtype=jnp.float32)
-
-        A0_rows = []
-        Aqk_rows = []
-        for i in range(NC):
-            r0, r1 = i * BC, (i + 1) * BC
-            g_rows = g_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
-            q_rows = q_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
-            k_rows = k_chunk[:, :, :, r0:r1, :]  # [B,H,N,BC,K]
-            beta_rows = beta_chunk[:, :, :, r0:r1]  # [B,H,N,BC]
-
-            # Diagonal block (i == j): exp(g_r - g_c) with r>=c is safe (<=0)
+        V_ = v.shape[-1]  # Get value dim from outer scope
+        
+        # Initialize output matrices
+        A0_full = jnp.zeros((B_, H_, N_, BT, BT), dtype=jnp.float32)
+        Aqk_full = jnp.zeros((B_, H_, N_, BT, BT), dtype=jnp.float32)
+        
+        def compute_row_block(i, outputs):
+            """Compute one row of blocks (i-th block row)."""
+            A0_acc, Aqk_acc = outputs
+            r0 = i * BC
+            
+            # Extract row block data using dynamic_slice
+            g_rows = lax.dynamic_slice(g_chunk, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
+            q_rows = lax.dynamic_slice(q_chunk, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
+            k_rows = lax.dynamic_slice(k_chunk, (0, 0, 0, r0, 0), (B_, H_, N_, BC, K_))
+            beta_rows = lax.dynamic_slice(beta_chunk, (0, 0, 0, r0), (B_, H_, N_, BC))
+            g_ref = lax.dynamic_slice(g_chunk, (0, 0, 0, r0, 0), (B_, H_, N_, 1, K_))[:, :, :, 0, :]
+            
+            # Compute diagonal block
             exp_rel_diag = _exp_leq0(g_rows[:, :, :, :, None, :] - g_rows[:, :, :, None, :, :])
             A0_diag = jnp.sum(
                 (k_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
@@ -463,49 +475,50 @@ def kda_chunkwise(
                 (q_rows[:, :, :, :, None, :] * k_rows[:, :, :, None, :, :]) * exp_rel_diag,
                 axis=-1,
             )
-            # Apply beta row-wise to A0 (strictly lower triangle only)
             A0_diag = A0_diag * beta_rows[:, :, :, :, None]
             A0_diag = jnp.where(tril_strict[None, None, None, :, :], A0_diag, 0.0)
-            # Aqk is causal inclusive (lower triangle including diagonal)
             Aqk_diag = jnp.where(tril_inclusive[None, None, None, :, :], Aqk_diag, 0.0)
-
-            row_blocks_A0 = []
-            row_blocks_Aqk = []
-            for j in range(NC):
-                if j < i:
-                    c0, c1 = j * BC, (j + 1) * BC
-                    g_cols = g_chunk[:, :, :, c0:c1, :]  # [B,H,N,BC,K]
-                    k_cols = k_chunk[:, :, :, c0:c1, :]  # [B,H,N,BC,K]
-
-                    # Reference gate at the start of the row block
-                    g_ref = g_chunk[:, :, :, r0, :]  # [B,H,N,K]
-
-                    # Both factors are <= 1 for causal blocks (j<i)
-                    row_scale = _exp_leq0(g_rows - g_ref[:, :, :, None, :])
-                    col_scale = _exp_leq0(g_ref[:, :, :, None, :] - g_cols)
-
-                    k_row_scaled = k_rows * row_scale
-                    k_col_scaled = k_cols * col_scale
-                    q_row_scaled = q_rows * row_scale
-
-                    A0_blk = jnp.matmul(k_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
-                    A0_blk = A0_blk * beta_rows[:, :, :, :, None]
-                    Aqk_blk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
-
-                    row_blocks_A0.append(A0_blk)
-                    row_blocks_Aqk.append(Aqk_blk)
-                elif j == i:
-                    row_blocks_A0.append(A0_diag)
-                    row_blocks_Aqk.append(Aqk_diag)
-                else:
-                    row_blocks_A0.append(zeros_block)
-                    row_blocks_Aqk.append(zeros_block)
-
-            A0_rows.append(jnp.concatenate(row_blocks_A0, axis=-1))
-            Aqk_rows.append(jnp.concatenate(row_blocks_Aqk, axis=-1))
-
-        A0_full = jnp.concatenate(A0_rows, axis=-2)   # [B,H,N,BT,BT]
-        Aqk_full = jnp.concatenate(Aqk_rows, axis=-2)  # [B,H,N,BT,BT]
+            
+            # Update diagonal block in output
+            A0_acc = lax.dynamic_update_slice(A0_acc, A0_diag, (0, 0, 0, r0, r0))
+            Aqk_acc = lax.dynamic_update_slice(Aqk_acc, Aqk_diag, (0, 0, 0, r0, r0))
+            
+            # Compute off-diagonal blocks (j < i) using inner fori_loop
+            def compute_col_block(j, inner_outputs):
+                """Compute block (i, j) where j < i."""
+                A0_inner, Aqk_inner = inner_outputs
+                c0 = j * BC
+                
+                # Extract column block data
+                g_cols = lax.dynamic_slice(g_chunk, (0, 0, 0, c0, 0), (B_, H_, N_, BC, K_))
+                k_cols = lax.dynamic_slice(k_chunk, (0, 0, 0, c0, 0), (B_, H_, N_, BC, K_))
+                
+                # Compute scaled values
+                row_scale = _exp_leq0(g_rows - g_ref[:, :, :, None, :])
+                col_scale = _exp_leq0(g_ref[:, :, :, None, :] - g_cols)
+                
+                k_row_scaled = k_rows * row_scale
+                k_col_scaled = k_cols * col_scale
+                q_row_scaled = q_rows * row_scale
+                
+                A0_blk = jnp.matmul(k_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+                A0_blk = A0_blk * beta_rows[:, :, :, :, None]
+                Aqk_blk = jnp.matmul(q_row_scaled, jnp.swapaxes(k_col_scaled, -1, -2))
+                
+                # Update block in output - only update if j < i (handled by loop bounds)
+                A0_inner = lax.dynamic_update_slice(A0_inner, A0_blk, (0, 0, 0, r0, c0))
+                Aqk_inner = lax.dynamic_update_slice(Aqk_inner, Aqk_blk, (0, 0, 0, r0, c0))
+                
+                return (A0_inner, Aqk_inner)
+            
+            # Inner loop: j from 0 to i (exclusive)
+            A0_acc, Aqk_acc = lax.fori_loop(0, i, compute_col_block, (A0_acc, Aqk_acc))
+            
+            return (A0_acc, Aqk_acc)
+        
+        # Outer loop: i from 0 to NC
+        A0_full, Aqk_full = lax.fori_loop(0, NC, compute_row_block, (A0_full, Aqk_full))
+        
         return A0_full, Aqk_full
 
     A0, Aqk = build_matrices_for_chunk(q, k, g, beta)
