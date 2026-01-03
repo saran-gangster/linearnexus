@@ -528,7 +528,13 @@ def kda_chunkwise(
     rhs_w = beta[..., None] * (k * exp_g)  # [B, H, N, BT, K]
     rhs_u = beta[..., None] * v            # [B, H, N, BT, V]
     rhs = jnp.concatenate([rhs_w, rhs_u], axis=-1)
-    solved = jax.lax.linalg.triangular_solve(M, rhs, left_side=True, lower=True)
+    solved = jax.lax.linalg.triangular_solve(
+        M,
+        rhs,
+        left_side=True,
+        lower=True,
+        unit_diagonal=True,
+    )
     w = solved[..., :key_dim]
     u = solved[..., key_dim:]
 
@@ -540,8 +546,6 @@ def kda_chunkwise(
     else:
         S0 = initial_state.astype(jnp.float32)
 
-    strict_upper = jnp.triu(jnp.ones((BT, BT), dtype=bool), k=1)
-
     def step(S, inputs):
         q_i, k_i, u_i, g_i, w_i, Aqk_i, exp_g_i = inputs
         # Shapes:
@@ -552,9 +556,6 @@ def kda_chunkwise(
         # w_i: [B, H, BT, K]
         # Aqk_i: [B, H, BT, BT]
         # exp_g_i: [B, H, BT, K]
-
-        # Safety: enforce causal mask.
-        Aqk_i = jnp.where(strict_upper[None, None, :, :], 0.0, Aqk_i)
 
         # v_i = u_i - w_i @ S
         WS = jnp.einsum("bhck,bhkv->bhcv", w_i, S)
