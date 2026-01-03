@@ -72,7 +72,7 @@ def debug_gated_deltanet():
     print(f"\n--- Forward Pass (batch={batch_size}, seq_len={seq_len}) ---")
     
     # Get embedding
-    x = model.tok_emb(input_ids)
+    x = model.embed(input_ids)
     check_nan("Embedding output", x)
     
     # Pass through each block
@@ -111,10 +111,10 @@ def debug_gated_deltanet():
             check_nan(f"  beta=sigmoid(b)", beta)
         
         if hasattr(block, 'A_log') and hasattr(block, 'dt_bias'):
-            A_exp = jnp.exp(block.A_log.value)
+            A_exp = jnp.exp(block.A_log[...])
             check_nan(f"  exp(A_log)", A_exp)
             
-            softplus_a = jax.nn.softplus(a + block.dt_bias.value)
+            softplus_a = jax.nn.softplus(a + block.dt_bias[...])
             check_nan(f"  softplus(a + dt_bias)", softplus_a)
             
             g = -A_exp * softplus_a
@@ -126,14 +126,16 @@ def debug_gated_deltanet():
             check_nan(f"  Block output", x)
         except Exception as e:
             print(f"  ❌ Block forward failed: {e}")
+            import traceback
+            traceback.print_exc()
             return
     
     # Final output
     print("\n--- Final Layers ---")
-    x = model.out_norm(x)
-    check_nan("After out_norm", x)
+    x = model.final_norm(x)
+    check_nan("After final_norm", x)
     
-    logits = model.out_proj(x)
+    logits = model.embed.unembed(x)
     check_nan("Logits", logits)
     
     print("\n--- Computing Loss ---")
