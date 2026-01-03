@@ -627,14 +627,15 @@ class GatedDeltaNetBlock(nnx.Module):
             q = jnp.repeat(q, repeat_factor, axis=1)
             k = jnp.repeat(k, repeat_factor, axis=1)
 
-        # Compute beta (learning rate)
-        beta = jax.nn.sigmoid(self.b_proj(self.norm(residual)))  # [batch, seq, num_v_heads]
+        # Compute beta (learning rate) - use x (already normalized hidden_states)
+        beta = jax.nn.sigmoid(self.b_proj(x))  # [batch, seq, num_v_heads]
         if self.allow_neg_eigval:
             beta = beta * 2.0
         beta = jnp.transpose(beta, (0, 2, 1))  # [batch, num_v_heads, seq]
 
         # Compute decay gate: g = -A * softplus(a + dt_bias)
-        a = self.a_proj(self.norm(residual))  # [batch, seq, num_v_heads]
+        # Note: Use x (normalized hidden_states), matching FLA reference
+        a = self.a_proj(x)  # [batch, seq, num_v_heads]
         g = -jnp.exp(self.A_log.value) * jax.nn.softplus(a + self.dt_bias.value)
         g = jnp.transpose(g, (0, 2, 1))  # [batch, num_v_heads, seq]
 
@@ -667,7 +668,8 @@ class GatedDeltaNetBlock(nnx.Module):
         # Apply output gating
         if self.use_gate:
             # g_out: [batch, seq, num_v_heads, head_v_dim]
-            g_out = self.g_proj(self.norm(residual))
+            # Note: Use x (normalized hidden_states), matching FLA reference
+            g_out = self.g_proj(x)
             g_out = g_out.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
             # o: [batch, num_v_heads, seq, head_v_dim] -> [batch, seq, num_v_heads, head_v_dim]
             o = jnp.transpose(o, (0, 2, 1, 3))
