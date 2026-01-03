@@ -411,8 +411,8 @@ def kda_chunkwise(
     beta = beta.astype(jnp.float32)
 
     # Cumulative gates within each chunk: g <- cumsum(g)
-    # Use associative_scan for parallel prefix sum (better GPU utilization)
-    g = jax.lax.associative_scan(jnp.add, g, axis=3)  # [B, H, N, BT, K]
+    # Prefer cumsum to avoid associative_scan lowering IR bloat.
+    g = lax.cumsum(g, axis=3)  # [B, H, N, BT, K]
 
     # ---------------------------------------------------------------------
     # Precompute Aqk and A (called Akk in FLA) per chunk.
