@@ -212,11 +212,14 @@ def delta_rule_chunkwise(
     """Chunkwise parallel delta rule using WY representation.
 
     For each chunk:
-        1. A = I + diag(beta) @ tril(K K^T, -1)
-        2. T = A^{-1} @ diag(beta)  (triangular solve)
-        3. W = T @ K, U = T @ V
-        4. O = Q @ S_0 + (Q K^T ⊙ mask) @ (U - W @ S_0)
-        5. S_new = S_0 + K^T @ (U - W @ S_0)
+        This matches the Flash-Linear-Attention (FLA) kernels:
+
+        1. Build strictly-lower A where A[i, j] = beta[i] * <k[i], k[j]> for i > j
+        2. Compute A_inv = (I + A)^{-1}
+        3. Compute w = A_inv @ (beta * k), u = A_inv @ (beta * v)
+        4. v_new = u - w @ S_0
+        5. O = q @ S_0 + (q k^T ⊙ causal) @ v_new
+        6. S_new = S_0 + k^T @ v_new
 
     Args:
         q: Query [batch, heads, seq_len, key_dim]
@@ -269,44 +272,48 @@ def delta_rule_chunkwise(
     else:
         S = initial_state.astype(jnp.float32)
 
+    eye_L = jnp.eye(chunk_size, dtype=jnp.float32)
+    causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.float32))
+
     def process_chunk(S, chunk_inputs):
         """Process one chunk using WY decomposition."""
         q_c, k_c, v_c, beta_c = chunk_inputs
-        L = chunk_size
 
-        # K @ K^T: [batch, heads, L, L]
+        # A = tril(beta * (K K^T), -1)  (strictly lower)
         kk = jnp.einsum("bhik,bhjk->bhij", k_c, k_c)
+        A_strict = jnp.tril(beta_c[..., :, None] * kk, k=-1)
 
-        # A = I + diag(beta) @ tril(K K^T, -1)
-        mask_lower = jnp.tril(jnp.ones((L, L), dtype=jnp.float32), k=-1)
-        M = kk * mask_lower
-        A = jnp.eye(L) + beta_c[..., None] * M
+        # A_inv = (I + A)^{-1}
+        A_full = eye_L + A_strict
+        eye_batched = jnp.broadcast_to(eye_L, A_full.shape)
+        A_inv = jax.lax.linalg.triangular_solve(
+            A_full,
+            eye_batched,
+            left_side=True,
+            lower=True,
+            transpose_a=False,
+            conjugate_a=False,
+            unit_diagonal=False,
+        )
 
-        # Solve A @ T = diag(beta) for T
-        diag_beta = jnp.eye(L, dtype=jnp.float32) * beta_c[..., None]
-        T = jax.lax.linalg.triangular_solve(A, diag_beta, left_side=True, lower=True)
+        # w = A_inv @ (beta * k), u = A_inv @ (beta * v)
+        k_beta = k_c * beta_c[..., :, None]
+        v_beta = v_c * beta_c[..., :, None]
+        w = jnp.einsum("bhij,bhjk->bhik", A_inv, k_beta)
+        u = jnp.einsum("bhij,bhjv->bhiv", A_inv, v_beta)
 
-        # W = T @ K, U = T @ V
-        W = jnp.einsum("bhij,bhjk->bhik", T, k_c)  # [batch, heads, L, key_dim]
-        U = jnp.einsum("bhij,bhjv->bhiv", T, v_c)  # [batch, heads, L, value_dim]
+        # v_new = u - w @ S
+        wS = jnp.einsum("bhik,bhkv->bhiv", w, S)
+        v_new = u - wS
 
-        # Correction: U - W @ S
-        WS = jnp.einsum("bhik,bhkv->bhiv", W, S)
-        correction = U - WS
-
-        # Inter-chunk: O_inter = Q @ S
+        # O = q @ S + (q k^T ⊙ causal) @ v_new
         O_inter = jnp.einsum("bhik,bhkv->bhiv", q_c, S)
-
-        # Intra-chunk: O_intra = (Q K^T ⊙ mask) @ correction
         qk = jnp.einsum("bhik,bhjk->bhij", q_c, k_c)
-        causal_mask = jnp.tril(jnp.ones((L, L), dtype=jnp.float32))
-        qk_masked = qk * causal_mask
-        O_intra = jnp.einsum("bhij,bhjv->bhiv", qk_masked, correction)
-
+        O_intra = jnp.einsum("bhij,bhjv->bhiv", qk * causal_mask, v_new)
         O_chunk = O_inter + O_intra
 
-        # State update: S_new = S + K^T @ correction
-        S_new = S + jnp.einsum("bhik,bhiv->bhkv", k_c, correction)
+        # S_new = S + k^T @ v_new
+        S_new = S + jnp.einsum("bhik,bhiv->bhkv", k_c, v_new)
 
         return S_new, O_chunk
 
