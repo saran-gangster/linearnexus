@@ -533,13 +533,9 @@ class DeltaNetBlock(nnx.Module):
             else:
                 self.conv_bias_param = None
 
-        # Q/K normalization
-        if qk_norm == "l2":
-            self.q_norm = RMSNorm(self.key_dim, eps=norm_eps, rngs=rngs)
-            self.k_norm = RMSNorm(self.key_dim, eps=norm_eps, rngs=rngs)
-        else:
-            self.q_norm = None
-            self.k_norm = None
+        # Q/K normalization is applied in `_apply_norm` (float32). Keep placeholders for BC.
+        self.q_norm = None
+        self.k_norm = None
 
         # Output projection
         self.out_proj = _LinearPTInit(v_total, hidden_size, rngs=rngs)
