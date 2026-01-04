@@ -433,7 +433,7 @@ class DeltaNetBlock(nnx.Module):
         qk_norm: str = "l2",
         chunk_size: int = 64,
         norm_type: Literal["rmsnorm", "layernorm"] = "rmsnorm",
-        norm_eps: float = 1e-6,
+        norm_eps: float = 1e-5,
         *,
         rngs: nnx.Rngs,
     ):
@@ -482,12 +482,26 @@ class DeltaNetBlock(nnx.Module):
         self.conv_size = conv_size
         if use_short_conv:
             conv_channels = qk_total + qk_total + v_total
-            # Weight shape: [kernel_size, channels]
+            # Match PyTorch Conv1d default init (kaiming_uniform_ with a=sqrt(5)):
+            # uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)) where fan_in = kernel_size for depthwise conv.
+            conv_bound = float(conv_size) ** -0.5
             self.conv_weight = nnx.Param(
-                jax.random.normal(rngs.params(), (conv_size, conv_channels)) * 0.02
+                jax.random.uniform(
+                    rngs.params(),
+                    (conv_size, conv_channels),
+                    minval=-conv_bound,
+                    maxval=conv_bound,
+                ).astype(jnp.float32)
             )
             if conv_bias:
-                self.conv_bias_param = nnx.Param(jnp.zeros((conv_channels,)))
+                self.conv_bias_param = nnx.Param(
+                    jax.random.uniform(
+                        rngs.params(),
+                        (conv_channels,),
+                        minval=-conv_bound,
+                        maxval=conv_bound,
+                    ).astype(jnp.float32)
+                )
             else:
                 self.conv_bias_param = None
 
@@ -518,12 +532,16 @@ class DeltaNetBlock(nnx.Module):
     def _apply_norm(self, q: jax.Array, k: jax.Array) -> Tuple[jax.Array, jax.Array]:
         """Apply normalization to Q/K."""
         if self.qk_norm_type == "l2":
-            q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
-            k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+            q_f32 = q.astype(jnp.float32)
+            k_f32 = k.astype(jnp.float32)
+            q = q_f32 / (jnp.linalg.norm(q_f32, axis=-1, keepdims=True) + 1e-6)
+            k = k_f32 / (jnp.linalg.norm(k_f32, axis=-1, keepdims=True) + 1e-6)
         elif self.qk_norm_type == "sum":
             # Match FLA's sum_norm: divide by sum (no abs).
-            q = q / (jnp.sum(q, axis=-1, keepdims=True) + 1e-6)
-            k = k / (jnp.sum(k, axis=-1, keepdims=True) + 1e-6)
+            q_f32 = q.astype(jnp.float32)
+            k_f32 = k.astype(jnp.float32)
+            q = q_f32 / (jnp.sum(q_f32, axis=-1, keepdims=True) + 1e-6)
+            k = k_f32 / (jnp.sum(k_f32, axis=-1, keepdims=True) + 1e-6)
         return q, k
 
     def __call__(
