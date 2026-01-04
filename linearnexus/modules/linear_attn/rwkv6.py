@@ -124,8 +124,8 @@ def rwkv6_recurrent(
     """Token-by-token RWKV6 recurrence.
 
     The recurrence is:
-        o_t = (h + u * k_t @ v_t^T) @ (r_t * scale)
-        h = h * exp(w_t) + k_t @ v_t^T
+        o_t = (h + u * k_t @ v_t^T) @ (sigmoid(r_t) * scale)
+        h = h * exp(-exp(w_t)) + k_t @ v_t^T
 
     Args:
         r: Receptance (query) tensor [batch, num_heads, seq_len, head_k_dim]
@@ -156,8 +156,8 @@ def rwkv6_recurrent(
         # v_t: [batch, heads, head_v_dim]
         # w_t: [batch, heads, head_k_dim]
 
-        # Scale receptance
-        r_t = r_t * scale
+        # Receptance gate (in RWKV-LM this is fused inside the CUDA kernel)
+        r_t = jax.nn.sigmoid(r_t) * scale
 
         # Compute k @ v^T: [batch, heads, head_k_dim, head_v_dim]
         kv_t = jnp.einsum("bhk,bhv->bhkv", k_t, v_t)
@@ -169,9 +169,9 @@ def rwkv6_recurrent(
         h_plus_ukv = h + u[None, :, :, None] * kv_t
         o_t = jnp.einsum("bhkv,bhk->bhv", h_plus_ukv, r_t)
 
-        # State update: h = h * exp(w) + kv
-        # w is already negative, so exp(w) < 1 (decay)
-        h_new = h * jnp.exp(w_t)[..., None] + kv_t
+        # State update: RWKV-6 uses a doubly-exponentiated decay exp(-exp(w)).
+        decay = jnp.exp(-jnp.exp(w_t))  # [batch, heads, head_k_dim]
+        h_new = h * decay[..., None] + kv_t
 
         return h_new, o_t
 
@@ -381,8 +381,8 @@ def rwkv6_step(
         output: [batch, num_heads, head_v_dim]
         new_state: [batch, num_heads, head_k_dim, head_v_dim]
     """
-    # Scale receptance
-    r = r * scale
+    # Receptance gate (in RWKV-LM this is fused inside the CUDA kernel)
+    r = jax.nn.sigmoid(r) * scale
 
     # Compute k @ v^T
     kv = jnp.einsum("bhk,bhv->bhkv", k, v)
@@ -391,8 +391,9 @@ def rwkv6_step(
     h_plus_ukv = state + u[None, :, :, None] * kv
     output = jnp.einsum("bhkv,bhk->bhv", h_plus_ukv, r)
 
-    # State update
-    new_state = state * jnp.exp(w)[..., None] + kv
+    # State update (RWKV-6): decay = exp(-exp(w))
+    decay = jnp.exp(-jnp.exp(w))
+    new_state = state * decay[..., None] + kv
 
     return output, new_state
 
@@ -651,42 +652,41 @@ class RWKV6Block(nnx.Module):
         # Input normalization
         self.ln1 = RMSNorm(hidden_size, eps=norm_eps, rngs=rngs)
 
-        # Time mixing: x_proj for computing data-dependent weights
-        # Projects to 5 * proj_low_rank_dim, then tanh, then back to hidden_size
-        self.x_proj_down = nnx.Linear(
-            hidden_size, 5 * proj_low_rank_dim, use_bias=False, rngs=rngs
-        )
+        # RWKV-LM x060 time-mix parameters.
+        ddd = (jnp.arange(hidden_size, dtype=jnp.float32) / float(hidden_size)).reshape(1, 1, -1)
+        self.time_maa_x = nnx.Param(1.0 - jnp.power(ddd, ratio_1_to_almost0))
+        self.time_maa_w = nnx.Param(1.0 - jnp.power(ddd, ratio_1_to_almost0))
+        self.time_maa_k = nnx.Param(1.0 - jnp.power(ddd, ratio_1_to_almost0))
+        self.time_maa_v = nnx.Param(1.0 - (jnp.power(ddd, ratio_1_to_almost0) + 0.3 * ratio_0_to_1))
+        self.time_maa_r = nnx.Param(1.0 - jnp.power(ddd, 0.5 * ratio_1_to_almost0))
+        self.time_maa_g = nnx.Param(1.0 - jnp.power(ddd, 0.5 * ratio_1_to_almost0))
+
+        # LoRA that generates (mw, mk, mv, mr, mg)
+        d_mix = proj_low_rank_dim
+        self.time_maa_w1 = nnx.Param(jnp.zeros((hidden_size, d_mix * 5), dtype=jnp.float32))
         key = rngs.params()
-        self.x_proj_up = nnx.Param(
-            jax.random.normal(key, (hidden_size, 5, proj_low_rank_dim)) * 0.02
+        self.time_maa_w2 = nnx.Param(
+            jax.random.uniform(key, (5, d_mix, hidden_size), minval=-0.01, maxval=0.01)
         )
 
-        # Base lerp weights for x projection
+        # Time-decay base + LoRA (RWKV-LM x060)
+        n = jnp.arange(hidden_size, dtype=jnp.float32)
+        denom = float(max(hidden_size - 1, 1))
+        decay_speed = -6.0 + 5.0 * jnp.power(n / denom, 0.7 + 1.3 * ratio_0_to_1)
+        self.time_decay = nnx.Param(decay_speed.reshape(1, 1, -1))
+
+        d_decay = gate_low_rank_dim
+        self.time_decay_w1 = nnx.Param(jnp.zeros((hidden_size, d_decay), dtype=jnp.float32))
         key = rngs.params()
-        time_maa_x_init = 1.0 - jnp.power(
-            jnp.arange(hidden_size) / hidden_size, ratio_1_to_almost0
+        self.time_decay_w2 = nnx.Param(
+            jax.random.uniform(key, (d_decay, hidden_size), minval=-0.01, maxval=0.01)
         )
-        self.time_maa_x = nnx.Param(time_maa_x_init.reshape(1, 1, -1))
 
-        # Bias added after x_proj
-        self.x_bias = nnx.Param(jnp.zeros((5, hidden_size)))
-
-        # RWKV projections with data-dependent lerp
-        self.r_proj = DDLerpLinear(
-            hidden_size, hidden_size, low_rank_dim=proj_low_rank_dim, rngs=rngs
-        )
-        self.w_proj = DDLerpLinear(
-            hidden_size, hidden_size, low_rank_dim=gate_low_rank_dim, rngs=rngs
-        )
-        self.k_proj = DDLerpLinear(
-            hidden_size, hidden_size, low_rank_dim=proj_low_rank_dim, rngs=rngs
-        )
-        self.v_proj = DDLerpLinear(
-            hidden_size, hidden_size, low_rank_dim=proj_low_rank_dim, rngs=rngs
-        )
-        self.g_proj = DDLerpLinear(
-            hidden_size, hidden_size, low_rank_dim=proj_low_rank_dim, rngs=rngs
-        )
+        # Projections
+        self.receptance = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs)
+        self.key = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs)
+        self.value = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs)
+        self.gate = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs)
 
         # Bonus term (u) - per-head
         key = rngs.params()
@@ -697,7 +697,7 @@ class RWKV6Block(nnx.Module):
         self.bonus = nnx.Param(u_init.reshape(num_heads, self.head_dim))
 
         # Output normalization and projection
-        self.g_norm = GroupNorm(num_heads, hidden_size, eps=norm_eps, rngs=rngs)
+        self.g_norm = GroupNorm(num_heads, hidden_size, eps=1e-5, rngs=rngs)
         self.o_proj = nnx.Linear(hidden_size, hidden_size, use_bias=False, rngs=rngs)
 
         # =====================================================================
@@ -707,13 +707,11 @@ class RWKV6Block(nnx.Module):
         # Input normalization
         self.ln2 = RMSNorm(hidden_size, eps=norm_eps, rngs=rngs)
 
-        # FFN lerp weights
-        key = rngs.params()
-        ffn_maa_init = 1.0 - jnp.power(
-            jnp.arange(hidden_size) / hidden_size, ratio_1_to_almost0
-        )
-        self.time_maa_k_ffn = nnx.Param(ffn_maa_init.reshape(1, 1, -1))
-        self.time_maa_r_ffn = nnx.Param(ffn_maa_init.reshape(1, 1, -1))
+        # FFN mixing weights (RWKV-LM x060)
+        ddd_ffn = (jnp.arange(hidden_size, dtype=jnp.float32) / float(hidden_size)).reshape(1, 1, -1)
+        ffn_mix = 1.0 - jnp.power(ddd_ffn, ratio_1_to_almost0**3)
+        self.time_maa_k_ffn = nnx.Param(ffn_mix)
+        self.time_maa_r_ffn = nnx.Param(ffn_mix)
 
         # FFN projections
         self.ffn_key = nnx.Linear(hidden_size, intermediate_size, use_bias=False, rngs=rngs)
@@ -791,44 +789,32 @@ class RWKV6Block(nnx.Module):
         # Compute time shift delta
         delta, new_shift = token_shift(x_norm, shift_state)
 
-        # Compute data-dependent weights via low-rank projection
-        # x_proj: [batch, seq, hidden] -> [batch, seq, 5*low_rank] -> tanh -> [batch, seq, 5, low_rank]
-        x_mixed = x_norm + delta * self.time_maa_x.value
-        x_proj = self.x_proj_down(x_mixed)  # [batch, seq, 5*low_rank]
-        x_proj = jnp.tanh(x_proj)
-        x_proj = x_proj.reshape(batch, seq_len, 5, self.proj_low_rank_dim)
+        # RWKV-LM x060: generate (mw, mk, mv, mr, mg) from (x + xx*time_maa_x)
+        xxx = x_norm + delta * self.time_maa_x.value
+        mix = jnp.tanh(jnp.einsum("bth,hd->btd", xxx, self.time_maa_w1.value))
+        mix = mix.reshape(batch, seq_len, 5, self.proj_low_rank_dim)
+        mix = jnp.einsum("btcd,cdh->btch", mix, self.time_maa_w2.value)
+        mw, mk, mv, mr, mg = jnp.split(mix, 5, axis=2)
+        mw = mw.squeeze(2)
+        mk = mk.squeeze(2)
+        mv = mv.squeeze(2)
+        mr = mr.squeeze(2)
+        mg = mg.squeeze(2)
 
-        # Project back to hidden size for each of 5 components
-        # x_proj_up: [hidden, 5, low_rank]
-        # einsum: 'b t n r, h n r -> b t n h'
-        # Input: [batch, seq, 5, low_rank] and [hidden, 5, low_rank]
-        # Output: [batch, seq, 5, hidden]
-        dd_weights = jnp.einsum(
-            "btnr,hnr->btnh", x_proj, self.x_proj_up.value
-        )  # [batch, seq, 5, hidden]
+        xw = x_norm + delta * (self.time_maa_w.value + mw)
+        xk = x_norm + delta * (self.time_maa_k.value + mk)
+        xv = x_norm + delta * (self.time_maa_v.value + mv)
+        xr = x_norm + delta * (self.time_maa_r.value + mr)
+        xg = x_norm + delta * (self.time_maa_g.value + mg)
 
-        # Add bias
-        dd_weights = dd_weights + self.x_bias.value[None, None, :, :]
+        r = self.receptance(xr)
+        k = self.key(xk)
+        v = self.value(xv)
+        g = jax.nn.silu(self.gate(xg))
 
-        # Split into r, w, k, v, g weights
-        r_weight, w_weight, k_weight, v_weight, g_weight = jnp.split(
-            dd_weights, 5, axis=2
-        )
-        r_weight = r_weight.squeeze(2)  # [batch, seq, hidden]
-        w_weight = w_weight.squeeze(2)
-        k_weight = k_weight.squeeze(2)
-        v_weight = v_weight.squeeze(2)
-        g_weight = g_weight.squeeze(2)
-
-        # Compute r, k, v, g, w with data-dependent lerp
-        r = self.r_proj(x_norm, r_weight, delta)  # [batch, seq, hidden]
-        k = self.k_proj(x_norm, k_weight, delta)
-        v = self.v_proj(x_norm, v_weight, delta)
-        g = jax.nn.silu(self.g_proj(x_norm, g_weight, delta))
-
-        # Decay w - needs different projection
-        w = self.w_proj(x_norm, w_weight, delta)
-        w = -jnp.exp(w)  # Ensure w is negative for decay
+        ww = jnp.tanh(jnp.einsum("bth,hd->btd", xw, self.time_decay_w1.value))
+        ww = jnp.einsum("btd,dh->bth", ww, self.time_decay_w2.value)
+        w = self.time_decay.value + ww
 
         # Reshape to heads: [batch, seq, heads, head_dim]
         r = r.reshape(batch, seq_len, self.num_heads, self.head_dim)
@@ -843,7 +829,7 @@ class RWKV6Block(nnx.Module):
         w = jnp.transpose(w, (0, 2, 1, 3))
 
         # Apply RWKV6 recurrence
-        scale = self.head_dim**-0.5
+        scale = 1.0
 
         if mode is None:
             mode = "recurrent" if seq_len == 1 else "chunk"

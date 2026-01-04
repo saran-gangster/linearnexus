@@ -281,18 +281,18 @@ class TestRWKV6Kernels:
         v = jax.random.normal(keys[2], (batch, num_heads, seq_len, head_dim))
         u = jax.random.normal(keys[4], (num_heads, head_dim))
         
-        # Strong decay
-        w_strong = -10.0 * jnp.ones((batch, num_heads, seq_len, head_dim))
-        _, state_strong = rwkv6_recurrent(r, k, v, w_strong, u)
-        
-        # Weak decay
-        w_weak = -0.1 * jnp.ones((batch, num_heads, seq_len, head_dim))
-        _, state_weak = rwkv6_recurrent(r, k, v, w_weak, u)
-        
-        # Weak decay should accumulate more state
-        state_strong_norm = jnp.linalg.norm(state_strong)
-        state_weak_norm = jnp.linalg.norm(state_weak)
-        assert state_weak_norm > state_strong_norm
+        # RWKV-6 uses decay = exp(-exp(w)). More-negative w => exp(w) smaller => decay closer to 1.
+        # So w=-10 corresponds to *weaker* decay than w=-0.1.
+        w_weaker_decay = -10.0 * jnp.ones((batch, num_heads, seq_len, head_dim))
+        _, state_weaker = rwkv6_recurrent(r, k, v, w_weaker_decay, u)
+
+        w_stronger_decay = -0.1 * jnp.ones((batch, num_heads, seq_len, head_dim))
+        _, state_stronger = rwkv6_recurrent(r, k, v, w_stronger_decay, u)
+
+        # Weaker decay should accumulate more state
+        state_weaker_norm = jnp.linalg.norm(state_weaker)
+        state_stronger_norm = jnp.linalg.norm(state_stronger)
+        assert state_weaker_norm > state_stronger_norm
 
 
 # =============================================================================
