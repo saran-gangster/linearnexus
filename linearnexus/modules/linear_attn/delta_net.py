@@ -62,6 +62,7 @@ This follows the exact formulation from FLA's naive.py:
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Literal
+import math
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -388,6 +389,37 @@ def delta_rule_step(
 # =============================================================================
 
 
+class _RMSNormF32(nnx.Module):
+    def __init__(self, dim: int, *, eps: float, rngs: nnx.Rngs):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,), dtype=jnp.float32))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x_f32 = x.astype(jnp.float32)
+        rms = jnp.sqrt(jnp.mean(x_f32 * x_f32, axis=-1, keepdims=True) + self.eps)
+        y = x_f32 / rms * self.weight.value
+        return y.astype(x.dtype)
+
+
+class _LinearPTInit(nnx.Module):
+    """Linear layer initialized like PyTorch nn.Linear (kaiming_uniform_ with a=sqrt(5))."""
+
+    def __init__(self, in_features: int, out_features: int, *, rngs: nnx.Rngs):
+        bound = 1.0 / math.sqrt(in_features)
+        self.weight = nnx.Param(
+            jax.random.uniform(
+                rngs.params(),
+                (in_features, out_features),
+                minval=-bound,
+                maxval=bound,
+            ).astype(jnp.float32)
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x: [..., in_features]
+        return jnp.einsum("...i,io->...o", x, self.weight.value).astype(x.dtype)
+
+
 class DeltaNetBlock(nnx.Module):
     """DeltaNet attention block with projections and optional gating.
 
@@ -454,28 +486,24 @@ class DeltaNetBlock(nnx.Module):
         self.qk_total = qk_total
         self.v_total = v_total
 
-        # Input normalization
-        from ..common import RMSNorm
+        # Input/output normalization: do math in float32 like FLA.
+        self.norm = _RMSNormF32(hidden_size, eps=norm_eps, rngs=rngs)
+        self.o_norm = _RMSNormF32(self.value_dim, eps=norm_eps, rngs=rngs)
 
-        self.norm = RMSNorm(hidden_size, eps=norm_eps, rngs=rngs)
-
-        # Output normalization (per-head value dim), matching FLA's o_norm behavior.
-        self.o_norm = RMSNorm(self.value_dim, eps=norm_eps, rngs=rngs)
-
-        # Projections
-        self.qkv_proj = nnx.Linear(
-            hidden_size, qk_total + qk_total + v_total, use_bias=False, rngs=rngs
+        # Projections: use PyTorch-style init to match FLA defaults more closely.
+        self.qkv_proj = _LinearPTInit(
+            hidden_size, qk_total + qk_total + v_total, rngs=rngs
         )
 
         # Beta projection (learning rate)
         self.use_beta = use_beta
         if use_beta:
-            self.beta_proj = nnx.Linear(hidden_size, num_heads, use_bias=False, rngs=rngs)
+            self.beta_proj = _LinearPTInit(hidden_size, num_heads, rngs=rngs)
 
         # Gate projection
         self.use_gate = use_gate
         if use_gate:
-            self.gate_proj = nnx.Linear(hidden_size, v_total, use_bias=False, rngs=rngs)
+            self.gate_proj = _LinearPTInit(hidden_size, v_total, rngs=rngs)
 
         # Short convolution
         self.use_short_conv = use_short_conv
@@ -514,7 +542,7 @@ class DeltaNetBlock(nnx.Module):
             self.k_norm = None
 
         # Output projection
-        self.out_proj = nnx.Linear(v_total, hidden_size, use_bias=False, rngs=rngs)
+        self.out_proj = _LinearPTInit(v_total, hidden_size, rngs=rngs)
 
     def _apply_activation(self, x: jax.Array) -> jax.Array:
         """Apply activation function to Q/K."""
