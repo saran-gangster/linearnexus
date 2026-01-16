@@ -131,6 +131,9 @@ def delta_rule_recurrent_pallas(
         # Single warpgroup is enough for correctness-first kernel.
         num_threads=1,
         thread_name="wg",
+        compiler_params=plgpu.CompilerParams(
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+        ),
     )
 
     out, state_out = compiled(q_f32, k_f32, v_f32, beta_f32, state_in)
