@@ -120,10 +120,6 @@ def delta_rule_recurrent_pallas(
             v_smem,
             out_smem,
             state_smem,
-            v_old_smem,
-            o_base_smem,
-            v_delta_smem,
-            qk_smem,
         ), (
             q_barrier,
             k_barrier,
@@ -161,55 +157,36 @@ def delta_rule_recurrent_pallas(
             plgpu.barrier_wait(k_barrier.at[0])
             plgpu.barrier_wait(v_barrier.at[0])
 
-            # Mosaic GPU lowering (JAX 0.8.2) currently rejects general
-            # broadcasting primitives. Implement delta-rule with explicit
-            # scalar loops over fixed sizes.
+            # Use register vectors for accumulation to avoid races / amplification
+            # across the 128 threads in a warpgroup.
             beta_t = v_smem.at[value_dim][...]
+            v_vec = v_smem[:value_dim]
 
-            # Zero accumulators without broadcasting.
-            qk_smem.at[0][...] = jnp.array(0.0, dtype=jnp.float32)
-
-            @pl.loop(0, value_dim)
-            def _zero_vecs(j):
-                v_old_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
-                o_base_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
-
-            # Accumulate:
-            #   v_old[j]  = sum_i state[i, j] * k[i]
-            #   o_base[j] = sum_i state[i, j] * q[i]
-            #   qk        = sum_i q[i] * k[i]
-            @pl.loop(0, key_dim)
-            def _accum_i(i):
+            def accum_step(i, carry):
+                v_old, o_base, qk = carry
                 k_i = k_smem.at[i][...]
                 q_i = q_smem.at[i][...]
-                qk_smem.at[0][...] = qk_smem.at[0][...] + (q_i * k_i)
+                row = state_smem[i, :]
+                v_old = v_old + row * k_i
+                o_base = o_base + row * q_i
+                qk = qk + (q_i * k_i)
+                return v_old, o_base, qk
 
-                @pl.loop(0, value_dim)
-                def _accum_j(j):
-                    s_ij = state_smem.at[i, j][...]
-                    v_old_smem.at[j][...] = v_old_smem.at[j][...] + (s_ij * k_i)
-                    o_base_smem.at[j][...] = o_base_smem.at[j][...] + (s_ij * q_i)
+            v_old0 = jnp.zeros((value_dim,), dtype=jnp.float32)
+            o_base0 = jnp.zeros((value_dim,), dtype=jnp.float32)
+            qk0 = jnp.array(0.0, dtype=jnp.float32)
+            v_old, o_base, qk = jax.lax.fori_loop(0, key_dim, accum_step, (v_old0, o_base0, qk0))
 
-            # v_delta[j] = beta * (v[j] - v_old[j])
-            @pl.loop(0, value_dim)
-            def _compute_v_delta(j):
-                v_j = v_smem.at[j][...]
-                v_delta_smem.at[j][...] = beta_t * (v_j - v_old_smem.at[j][...])
+            v_delta = beta_t * (v_vec - v_old)
+            out_vec = o_base + qk * v_delta
+            out_smem[...] = out_vec.astype(out_ref.dtype)
 
-            # out[j] = o_base[j] + qk * v_delta[j]
-            @pl.loop(0, value_dim)
-            def _write_out(j):
-                out_val = o_base_smem.at[j][...] + (qk_smem.at[0][...] * v_delta_smem.at[j][...])
-                out_smem.at[j][...] = out_val.astype(out_ref.dtype)
-
-            # state[i, j] += k[i] * v_delta[j]
-            @pl.loop(0, key_dim)
-            def _update_i(i):
+            def update_step(i, _):
                 k_i = k_smem.at[i][...]
+                state_smem[i, :] = state_smem[i, :] + k_i * v_delta
+                return None
 
-                @pl.loop(0, value_dim)
-                def _update_j(j):
-                    state_smem.at[i, j][...] = state_smem.at[i, j][...] + (k_i * v_delta_smem.at[j][...])
+            jax.lax.fori_loop(0, key_dim, update_step, None)
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
@@ -235,13 +212,9 @@ def delta_rule_recurrent_pallas(
         v_smem = plgpu.SMEM((value_dim_padded,), jnp.float32)
         out_smem = plgpu.SMEM((value_dim,), q.dtype)
         state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
-        v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
-        o_base_smem = plgpu.SMEM((value_dim,), jnp.float32)
-        v_delta_smem = plgpu.SMEM((value_dim,), jnp.float32)
-        qk_smem = plgpu.SMEM((1,), jnp.float32)
         pl.run_scoped(
             lambda *scoped: kernel(q_ref, k_ref, v_ref, state_in_ref, out_ref, state_out_ref, scoped),
-            (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
+            (q_smem, k_smem, v_smem, out_smem, state_smem),
             (
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
