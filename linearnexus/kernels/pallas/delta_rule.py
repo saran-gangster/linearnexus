@@ -183,7 +183,15 @@ def delta_rule_recurrent_pallas(
 
             def update_step(i, _):
                 k_i = k_smem.at[i][...]
-                state_smem[i, :] = state_smem[i, :] + k_i * v_delta
+
+                # Avoid vector stores to SMEM slices; write elementwise.
+                row = state_smem[i, :]
+                row_new = row + k_i * v_delta
+
+                @pl.loop(0, value_dim)
+                def _store_j(j):
+                    state_smem.at[i, j][...] = row_new[j]
+
                 return None
 
             jax.lax.fori_loop(0, key_dim, update_step, None)
