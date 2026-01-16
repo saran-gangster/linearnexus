@@ -86,51 +86,128 @@ def delta_rule_recurrent_pallas(
     else:
         state_in = initial_state.astype(jnp.float32)
 
-    # Use Mosaic GPU backend directly. This aligns with patterns in docs/reference
-    # and avoids NaNs observed with `pl.pallas_call` on A100.
+    # Mosaic GPU lowering in some JAX versions cannot lower generic masked
+    # loads/stores emitted by `pl.load` / `pl.store`. Follow the FlashAttention3
+    # reference style (docs/reference/attention_mgpu.py): move all global memory
+    # traffic through explicit TMA copies to SMEM, then compute from SMEM.
+    #
+    # For now, keep the supported shapes conservative to ensure TMA-friendly
+    # copies (and let callers fall back to the reference kernel otherwise).
+    if key_dim % 8 != 0 or value_dim % 8 != 0:
+        raise RuntimeError(
+            "Pallas delta-rule currently requires key_dim and value_dim to be multiples of 8 "
+            "(TMA/SMEM copy friendly)."
+        )
+
     out_shape = [
         jax.ShapeDtypeStruct((batch, heads, seq_len, value_dim), q.dtype),
         jax.ShapeDtypeStruct((batch, heads, key_dim, value_dim), jnp.float32),
     ]
 
-    def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
+    def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped):
         b = jax.lax.axis_index("b")
         h = jax.lax.axis_index("h")
+        (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem), (
+            q_barrier,
+            k_barrier,
+            v_barrier,
+            beta_barrier,
+            out_barrier,
+            state_barrier,
+        ) = scoped
 
-        S = pl.load(
-            state_in_ref,
-            (b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)),
-        ).astype(jnp.float32)
+        # Load initial state into SMEM once.
+        plgpu.copy_gmem_to_smem(
+            state_in_ref.at[b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)],
+            state_smem,
+            state_barrier.at[0],
+        )
+        plgpu.barrier_wait(state_barrier.at[0])
+        S = state_smem[...].astype(jnp.float32)
 
         def body(t, S_carry):
-            k_t = pl.load(k_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
-            v_t = pl.load(v_ref, (b, h, t, pl.ds(0, value_dim))).astype(jnp.float32)
-            q_t = pl.load(q_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
-            beta_t = pl.load(beta_ref, (b, h, t)).astype(jnp.float32)
+            plgpu.copy_gmem_to_smem(
+                q_ref.at[b, h, t, pl.ds(0, key_dim)],
+                q_smem,
+                q_barrier.at[0],
+            )
+            plgpu.copy_gmem_to_smem(
+                k_ref.at[b, h, t, pl.ds(0, key_dim)],
+                k_smem,
+                k_barrier.at[0],
+            )
+            plgpu.copy_gmem_to_smem(
+                v_ref.at[b, h, t, pl.ds(0, value_dim)],
+                v_smem,
+                v_barrier.at[0],
+            )
+            plgpu.copy_gmem_to_smem(
+                beta_ref.at[b, h, pl.ds(t, 1)],
+                beta_smem,
+                beta_barrier.at[0],
+            )
+
+            plgpu.barrier_wait(q_barrier.at[0])
+            plgpu.barrier_wait(k_barrier.at[0])
+            plgpu.barrier_wait(v_barrier.at[0])
+            plgpu.barrier_wait(beta_barrier.at[0])
+
+            q_t = q_smem[...].astype(jnp.float32)
+            k_t = k_smem[...].astype(jnp.float32)
+            v_t = v_smem[...].astype(jnp.float32)
+            beta_t = beta_smem[0].astype(jnp.float32)
 
             v_old = jnp.einsum("kv,k->v", S_carry, k_t)
             v_delta = beta_t * (v_t - v_old)
             S_new = S_carry + jnp.einsum("k,v->kv", k_t, v_delta)
             o_t = jnp.einsum("k,kv->v", q_t, S_new)
 
-            pl.store(out_ref, (b, h, t, pl.ds(0, value_dim)), o_t.astype(out_ref.dtype))
+            out_smem[...] = o_t.astype(out_ref.dtype)
+            plgpu.commit_smem()
+            plgpu.copy_smem_to_gmem(
+                out_smem,
+                out_ref.at[b, h, t, pl.ds(0, value_dim)],
+            )
+            plgpu.wait_smem_to_gmem(0)
             return S_new
 
         S_final = jax.lax.fori_loop(0, seq_len, body, S)
-        pl.store(
-            state_out_ref,
-            (b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)),
-            S_final,
+
+        state_smem[...] = S_final.astype(jnp.float32)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(
+            state_smem,
+            state_out_ref.at[b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)],
+        )
+        plgpu.wait_smem_to_gmem(0)
+
+    def entry(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
+        q_smem = plgpu.SMEM((key_dim,), jnp.float32)
+        k_smem = plgpu.SMEM((key_dim,), jnp.float32)
+        v_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        beta_smem = plgpu.SMEM((1,), jnp.float32)
+        out_smem = plgpu.SMEM((value_dim,), q.dtype)
+        state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
+        pl.run_scoped(
+            lambda *scoped: kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped),
+            (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem),
+            (
+                plgpu.Barrier(num_barriers=1),
+                plgpu.Barrier(num_barriers=1),
+                plgpu.Barrier(num_barriers=1),
+                plgpu.Barrier(num_barriers=1),
+                plgpu.Barrier(num_barriers=1),
+                plgpu.Barrier(num_barriers=1),
+            ),
+            collective_axes="wg",
         )
 
     compiled = plgpu.kernel(
-        kernel,
+        entry,
         out_shape=out_shape,
         grid=(batch, heads),
         grid_names=("b", "h"),
         # Correctness-first: single warpgroup thread.
-        # NOTE: Mosaic GPU kernels use warpgroup thread semantics; set the
-        # lowering semantics accordingly to avoid Lane/Warpgroup mismatches.
         num_threads=1,
         thread_name="wg",
         compiler_params=plgpu.CompilerParams(
