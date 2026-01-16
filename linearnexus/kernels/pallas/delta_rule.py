@@ -176,17 +176,22 @@ def delta_rule_recurrent_pallas(
             # v_old = sum_i state[i, :] * k[i]
             # o_base = sum_i state[i, :] * q[i]
             # qk = sum_i q[i] * k[i]
-            v_old = jnp.sum(state * k_vec[:, None], axis=0)
-            o_base = jnp.sum(state * q_vec[:, None], axis=0)
+            # NOTE: Avoid implicit broadcasting in Warpgroup semantics.
+            k_mat = jax.lax.broadcast_in_dim(k_vec, (key_dim, value_dim), (0,))
+            q_mat = jax.lax.broadcast_in_dim(q_vec, (key_dim, value_dim), (0,))
+            v_old = jnp.sum(state * k_mat, axis=0)
+            o_base = jnp.sum(state * q_mat, axis=0)
             qk = jnp.sum(q_vec * k_vec)
 
-            v_delta = (v_vec - v_old) * beta_vec
+            beta_full = jax.lax.broadcast_in_dim(beta_vec, (value_dim,), (0,))
+            v_delta = (v_vec - v_old) * beta_full
             out_vec = o_base + qk * v_delta
             out_smem[...] = out_vec.astype(out_ref.dtype)
 
             # State update: state += k[:, None] * v_delta[None, :]
             # Full-tile SMEM store avoids scalar stores that can trigger squeeze.
-            state_smem[...] = state + k_vec[:, None] * v_delta[None, :]
+            v_mat = jax.lax.broadcast_in_dim(v_delta, (key_dim, value_dim), (1,))
+            state_smem[...] = state + k_mat * v_mat
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
