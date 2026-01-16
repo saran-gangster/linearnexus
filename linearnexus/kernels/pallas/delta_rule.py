@@ -29,7 +29,19 @@ def _pallas_is_usable() -> bool:
     except Exception:
         return False
 
-    return any(device.platform == "gpu" for device in jax.devices())
+    gpus = [d for d in jax.devices() if d.platform == "gpu"]
+    if not gpus:
+        return False
+
+    # Mosaic GPU async bulk copy (used by plgpu.copy_* / wait_*) requires
+    # Hopper+ (SM90). On Ada (e.g. RTX 4090 / SM89) this fails at compile time
+    # with NVVM errors like:
+    #   "nvvm.cp.async.bulk.wait_group op is not supported on sm_89"
+    try:
+        cc = float(getattr(gpus[0], "compute_capability", 0.0))
+    except Exception:
+        cc = 0.0
+    return cc >= 9.0
 
 
 def delta_rule_recurrent_pallas(
@@ -59,7 +71,11 @@ def delta_rule_recurrent_pallas(
     """
 
     if not _pallas_is_usable():
-        raise RuntimeError("Pallas backend is not usable (need JAX Pallas + GPU).")
+        raise RuntimeError(
+            "Pallas Mosaic GPU backend is not usable on this machine. "
+            "This delta-rule kernel currently requires a Hopper+ GPU (SM90+) "
+            "due to Mosaic bulk async copy support."
+        )
 
     from jax.experimental import pallas as pl
     import jax.experimental.pallas.mosaic_gpu as plgpu
