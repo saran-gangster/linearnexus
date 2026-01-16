@@ -74,7 +74,9 @@ def delta_rule_recurrent_pallas(
         scale = key_dim**-0.5
 
     # Compute in float32 for stability (matches reference behavior).
-    q_f32 = q.astype(jnp.float32)
+    # IMPORTANT: Mosaic kernels can't close over traced JAX values (e.g. a
+    # jnp.asarray(scale) captured in the kernel body). Pre-apply scaling here.
+    q_f32 = q.astype(jnp.float32) * jnp.asarray(scale, dtype=jnp.float32)
     k_f32 = k.astype(jnp.float32)
     v_f32 = v.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
@@ -91,8 +93,6 @@ def delta_rule_recurrent_pallas(
         jax.ShapeDtypeStruct((batch, heads, key_dim, value_dim), jnp.float32),
     ]
 
-    scale_f32 = jnp.asarray(scale, dtype=jnp.float32)
-
     def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
         b = jax.lax.axis_index("b")
         h = jax.lax.axis_index("h")
@@ -105,10 +105,7 @@ def delta_rule_recurrent_pallas(
         def body(t, S_carry):
             k_t = pl.load(k_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
             v_t = pl.load(v_ref, (b, h, t, pl.ds(0, value_dim))).astype(jnp.float32)
-            q_t = (
-                pl.load(q_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
-                * scale_f32
-            )
+            q_t = pl.load(q_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
             beta_t = pl.load(beta_ref, (b, h, t)).astype(jnp.float32)
 
             v_old = jnp.einsum("kv,k->v", S_carry, k_t)
