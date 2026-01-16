@@ -157,10 +157,15 @@ def delta_rule_recurrent_pallas(
             v_t = v_smem[...].astype(jnp.float32)
             beta_t = beta_smem[0].astype(jnp.float32)
 
-            v_old = jnp.einsum("kv,k->v", S_carry, k_t)
-            v_delta = beta_t * (v_t - v_old)
-            S_new = S_carry + jnp.einsum("k,v->kv", k_t, v_delta)
-            o_t = jnp.einsum("k,kv->v", q_t, S_new)
+            # Avoid `einsum`/`dot_general` inside Mosaic kernels.
+            # Shapes:
+            #   S_carry: [key_dim, value_dim]
+            #   k_t/q_t: [key_dim]
+            #   v_t:     [value_dim]
+            v_old = jnp.sum(S_carry * k_t[:, None], axis=0)  # [value_dim]
+            v_delta = beta_t * (v_t - v_old)  # [value_dim]
+            S_new = S_carry + k_t[:, None] * v_delta[None, :]  # [key_dim, value_dim]
+            o_t = jnp.sum(S_new * q_t[:, None], axis=0)  # [value_dim]
 
             out_smem[...] = o_t.astype(out_ref.dtype)
             plgpu.commit_smem()
