@@ -128,13 +128,13 @@ def delta_rule_recurrent_pallas(
         out_shape=out_shape,
         grid=(batch, heads),
         grid_names=("b", "h"),
-        # Correctness-first: single lane/thread.
-        # NOTE: Using lane semantics avoids a Lane/Warpgroup mismatch that can
-        # trigger Mosaic lowering failures for masked_load on some JAX builds.
+        # Correctness-first: single warpgroup thread.
+        # NOTE: Mosaic GPU kernels use warpgroup thread semantics; set the
+        # lowering semantics accordingly to avoid Lane/Warpgroup mismatches.
         num_threads=1,
-        thread_name="lane",
+        thread_name="wg",
         compiler_params=plgpu.CompilerParams(
-            lowering_semantics=plgpu.LoweringSemantics.Lane,
+            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
         ),
     )
 
