@@ -107,7 +107,18 @@ def delta_rule_recurrent_pallas(
     def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped):
         b = jax.lax.axis_index("b")
         h = jax.lax.axis_index("h")
-        (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem), (
+        (
+            q_smem,
+            k_smem,
+            v_smem,
+            beta_smem,
+            out_smem,
+            state_smem,
+            v_old_smem,
+            o_base_smem,
+            v_delta_smem,
+            qk_smem,
+        ), (
             q_barrier,
             k_barrier,
             v_barrier,
@@ -123,9 +134,8 @@ def delta_rule_recurrent_pallas(
             state_barrier.at[0],
         )
         plgpu.barrier_wait(state_barrier.at[0])
-        S = state_smem[...].astype(jnp.float32)
 
-        def body(t, S_carry):
+        def body(t, _):
             plgpu.copy_gmem_to_smem(
                 q_ref.at[b, h, t, pl.ds(0, key_dim)],
                 q_smem,
@@ -152,33 +162,67 @@ def delta_rule_recurrent_pallas(
             plgpu.barrier_wait(v_barrier.at[0])
             plgpu.barrier_wait(beta_barrier.at[0])
 
-            q_t = q_smem[...].astype(jnp.float32)
-            k_t = k_smem[...].astype(jnp.float32)
-            v_t = v_smem[...].astype(jnp.float32)
-            beta_t = beta_smem[0].astype(jnp.float32)
+            # Mosaic GPU lowering (JAX 0.8.2) currently rejects general
+            # broadcasting primitives. Implement delta-rule with explicit
+            # scalar loops over fixed sizes.
+            beta_t = beta_smem.at[0][...]
 
-            # Avoid `einsum`/`dot_general` inside Mosaic kernels.
-            # Shapes:
-            #   S_carry: [key_dim, value_dim]
-            #   k_t/q_t: [key_dim]
-            #   v_t:     [value_dim]
-            v_old = jnp.sum(S_carry * k_t[:, None], axis=0)  # [value_dim]
-            v_delta = beta_t * (v_t - v_old)  # [value_dim]
-            S_new = S_carry + k_t[:, None] * v_delta[None, :]  # [key_dim, value_dim]
-            o_t = jnp.sum(S_new * q_t[:, None], axis=0)  # [value_dim]
+            # Zero accumulators without broadcasting.
+            qk_smem.at[0][...] = jnp.array(0.0, dtype=jnp.float32)
 
-            out_smem[...] = o_t.astype(out_ref.dtype)
+            @pl.loop(0, value_dim)
+            def _zero_vecs(j):
+                v_old_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
+                o_base_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
+
+            # Accumulate:
+            #   v_old[j]  = sum_i state[i, j] * k[i]
+            #   o_base[j] = sum_i state[i, j] * q[i]
+            #   qk        = sum_i q[i] * k[i]
+            @pl.loop(0, key_dim)
+            def _accum_i(i):
+                k_i = k_smem.at[i][...]
+                q_i = q_smem.at[i][...]
+                qk_smem.at[0][...] = qk_smem.at[0][...] + (q_i * k_i)
+
+                @pl.loop(0, value_dim)
+                def _accum_j(j):
+                    s_ij = state_smem.at[i, j][...]
+                    v_old_smem.at[j][...] = v_old_smem.at[j][...] + (s_ij * k_i)
+                    o_base_smem.at[j][...] = o_base_smem.at[j][...] + (s_ij * q_i)
+
+            # v_delta[j] = beta * (v[j] - v_old[j])
+            @pl.loop(0, value_dim)
+            def _compute_v_delta(j):
+                v_j = v_smem.at[j][...]
+                v_delta_smem.at[j][...] = beta_t * (v_j - v_old_smem.at[j][...])
+
+            # out[j] = o_base[j] + qk * v_delta[j]
+            @pl.loop(0, value_dim)
+            def _write_out(j):
+                out_val = o_base_smem.at[j][...] + (qk_smem.at[0][...] * v_delta_smem.at[j][...])
+                out_smem.at[j][...] = out_val.astype(out_ref.dtype)
+
+            # state[i, j] += k[i] * v_delta[j]
+            @pl.loop(0, key_dim)
+            def _update_i(i):
+                k_i = k_smem.at[i][...]
+
+                @pl.loop(0, value_dim)
+                def _update_j(j):
+                    state_smem.at[i, j][...] = state_smem.at[i, j][...] + (k_i * v_delta_smem.at[j][...])
+
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
                 out_smem,
                 out_ref.at[b, h, t, pl.ds(0, value_dim)],
             )
             plgpu.wait_smem_to_gmem(0)
-            return S_new
 
-        S_final = jax.lax.fori_loop(0, seq_len, body, S)
+            return None
 
-        state_smem[...] = S_final.astype(jnp.float32)
+        jax.lax.fori_loop(0, seq_len, body, None)
+
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(
             state_smem,
@@ -193,9 +237,13 @@ def delta_rule_recurrent_pallas(
         beta_smem = plgpu.SMEM((1,), jnp.float32)
         out_smem = plgpu.SMEM((value_dim,), q.dtype)
         state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
+        v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        o_base_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        v_delta_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        qk_smem = plgpu.SMEM((1,), jnp.float32)
         pl.run_scoped(
             lambda *scoped: kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped),
-            (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem),
+            (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
             (
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
