@@ -86,25 +86,32 @@ def delta_rule_recurrent_pallas(
     else:
         state_in = initial_state.astype(jnp.float32)
 
-    # Mosaic GPU lowering in some JAX versions cannot lower generic masked
-    # loads/stores emitted by `pl.load` / `pl.store`. Follow the FlashAttention3
-    # reference style (docs/reference/attention_mgpu.py): move all global memory
-    # traffic through explicit TMA copies to SMEM, then compute from SMEM.
-    #
-    # For now, keep the supported shapes conservative to ensure TMA-friendly
-    # copies (and let callers fall back to the reference kernel otherwise).
-    if key_dim % 8 != 0 or value_dim % 8 != 0:
+    # Mosaic GPU uses TMA for GMEM<->SMEM copies and requires each copy to be a
+    # multiple of 128 bytes. Keep dimensions conservative (and rely on fallback
+    # for other shapes).
+    if key_dim % 32 != 0:
         raise RuntimeError(
-            "Pallas delta-rule currently requires key_dim and value_dim to be multiples of 8 "
-            "(TMA/SMEM copy friendly)."
+            "Pallas delta-rule currently requires key_dim to be a multiple of 32 (128B TMA)."
         )
+    if value_dim % 64 != 0:
+        raise RuntimeError(
+            "Pallas delta-rule currently requires value_dim to be a multiple of 64 (128B bf16 TMA for output)."
+        )
+
+    # Avoid scalar beta loads inside Mosaic kernels (they tend to lower to
+    # masked_load in JAX 0.8.2). Pack beta into a padded V buffer so beta is
+    # carried via a regular TMA copy.
+    value_dim_padded = int(((value_dim + 1 + 31) // 32) * 32)  # float32 elems
+    v_padded = jnp.zeros((batch, heads, seq_len, value_dim_padded), dtype=jnp.float32)
+    v_padded = v_padded.at[:, :, :, :value_dim].set(v_f32)
+    v_padded = v_padded.at[:, :, :, value_dim].set(beta_f32)
 
     out_shape = [
         jax.ShapeDtypeStruct((batch, heads, seq_len, value_dim), q.dtype),
         jax.ShapeDtypeStruct((batch, heads, key_dim, value_dim), jnp.float32),
     ]
 
-    def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped):
+    def kernel(q_ref, k_ref, v_ref, state_in_ref, out_ref, state_out_ref, scoped):
         b = jax.lax.axis_index("b")
         h = jax.lax.axis_index("h")
         (
@@ -145,7 +152,7 @@ def delta_rule_recurrent_pallas(
                 k_barrier.at[0],
             )
             plgpu.copy_gmem_to_smem(
-                v_ref.at[b, h, t, pl.ds(0, value_dim)],
+                v_ref.at[b, h, t, pl.ds(0, value_dim_padded)],
                 v_smem,
                 v_barrier.at[0],
             )
@@ -157,9 +164,7 @@ def delta_rule_recurrent_pallas(
             # Mosaic GPU lowering (JAX 0.8.2) currently rejects general
             # broadcasting primitives. Implement delta-rule with explicit
             # scalar loops over fixed sizes.
-            # NOTE: Mosaic GPU TMA copies must be multiples of 128 bytes.
-            # Loading beta via TMA (4 bytes) fails. Instead, use a scalar load.
-            beta_t = pl.load(beta_ref, (b, h, t)).astype(jnp.float32)
+            beta_t = v_smem.at[value_dim][...]
 
             # Zero accumulators without broadcasting.
             qk_smem.at[0][...] = jnp.array(0.0, dtype=jnp.float32)
@@ -227,7 +232,7 @@ def delta_rule_recurrent_pallas(
     def entry(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
         q_smem = plgpu.SMEM((key_dim,), jnp.float32)
         k_smem = plgpu.SMEM((key_dim,), jnp.float32)
-        v_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        v_smem = plgpu.SMEM((value_dim_padded,), jnp.float32)
         out_smem = plgpu.SMEM((value_dim,), q.dtype)
         state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
         v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
@@ -235,7 +240,7 @@ def delta_rule_recurrent_pallas(
         v_delta_smem = plgpu.SMEM((value_dim,), jnp.float32)
         qk_smem = plgpu.SMEM((1,), jnp.float32)
         pl.run_scoped(
-            lambda *scoped: kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped),
+            lambda *scoped: kernel(q_ref, k_ref, v_ref, state_in_ref, out_ref, state_out_ref, scoped),
             (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
             (
                 plgpu.Barrier(num_barriers=1),
@@ -260,5 +265,5 @@ def delta_rule_recurrent_pallas(
         ),
     )
 
-    out, state_out = compiled(q_f32, k_f32, v_f32, beta_f32, state_in)
+    out, state_out = compiled(q_f32, k_f32, v_padded, beta_f32, state_in)
     return out, state_out
