@@ -162,9 +162,15 @@ def delta_rule_recurrent_pallas(
             plgpu.barrier_wait(v_barrier.at[0])
 
             # Reset scratch accumulators.
-            v_old_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
-            o_base_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
+            # NOTE: Avoid storing a 64-element WG_SPLAT vector into SMEM.
+            # Mosaic currently only allows stores of splat-layout vectors when
+            # they have 1 element or a multiple of 128 elements.
             qk_smem[...] = jnp.array(0.0, dtype=jnp.float32)
+            @pl.loop(0, value_dim)
+            def _zero_j(j):
+                v_old_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
+                o_base_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
+                v_delta_smem.at[j][...] = jnp.array(0.0, dtype=jnp.float32)
 
             # Accumulate v_old[j] = sum_i state[i,j]*k[i], o_base[j] = sum_i state[i,j]*q[i]
             # and qk = sum_i q[i]*k[i] using scalar SMEM loads/stores only.
