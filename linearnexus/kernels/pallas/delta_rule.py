@@ -165,35 +165,28 @@ def delta_rule_recurrent_pallas(
             q_vec = q_smem[...]
             k_vec = k_smem[...]
             v_tile = v_smem[...]
+            state = state_smem[...]
 
-            # Use register vectors for accumulation to avoid races / amplification
-            # across the 128 threads in a warpgroup.
-            beta_t = v_tile[value_dim]
-            v_vec = v_tile[:value_dim]
+            # IMPORTANT: Avoid scalar indexing (x[i]) inside Warpgroup semantics.
+            # In JAX 0.8.2 Mosaic GPU lowering, scalar extraction frequently lowers
+            # to `lax.squeeze`, which is currently unimplemented.
+            beta_vec = v_tile[value_dim : value_dim + 1]  # [1]
+            v_vec = v_tile[:value_dim]  # [value_dim]
 
-            v_old = jnp.zeros((value_dim,), dtype=jnp.float32)
-            o_base = jnp.zeros((value_dim,), dtype=jnp.float32)
-            qk = jnp.array(0.0, dtype=jnp.float32)
+            # v_old = sum_i state[i, :] * k[i]
+            # o_base = sum_i state[i, :] * q[i]
+            # qk = sum_i q[i] * k[i]
+            v_old = jnp.sum(state * k_vec[:, None], axis=0)
+            o_base = jnp.sum(state * q_vec[:, None], axis=0)
+            qk = jnp.sum(q_vec * k_vec)
 
-            for i in range(key_dim):
-                k_i = k_vec[i]
-                q_i = q_vec[i]
-                row = state_smem[i, :]
-                v_old = v_old + row * k_i
-                o_base = o_base + row * q_i
-                qk = qk + (q_i * k_i)
-
-            v_delta = beta_t * (v_vec - v_old)
-            out_vec = o_base + (qk * v_delta)
+            v_delta = (v_vec - v_old) * beta_vec
+            out_vec = o_base + qk * v_delta
             out_smem[...] = out_vec.astype(out_ref.dtype)
 
-            # Update state_smem in-place (elementwise stores are the most
-            # robust w.r.t. layout inference).
-            for i in range(key_dim):
-                k_i = k_vec[i]
-                row_new = state_smem[i, :] + k_i * v_delta
-                for j in range(value_dim):
-                    state_smem.at[i, j][...] = row_new[j]
+            # State update: state += k[:, None] * v_delta[None, :]
+            # Full-tile SMEM store avoids scalar stores that can trigger squeeze.
+            state_smem[...] = state + k_vec[:, None] * v_delta[None, :]
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
