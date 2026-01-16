@@ -23,6 +23,16 @@ import jax.numpy as jnp
 from linearnexus.modules.linear_attn.delta_net import delta_rule_recurrent
 
 
+def _print_debug_imports() -> None:
+    try:
+        import linearnexus.kernels.pallas.delta_rule as pallas_delta_rule
+
+        print(f"JAX version: {jax.__version__}")
+        print(f"Pallas delta_rule module: {pallas_delta_rule.__file__}")
+    except Exception as e:
+        print(f"debug imports: unavailable ({type(e).__name__}: {e})")
+
+
 def _has_gpu() -> bool:
     return any(d.platform == "gpu" for d in jax.devices())
 
@@ -73,6 +83,8 @@ def main() -> None:
         help="Run a preset sweep of larger shapes (GPU recommended).",
     )
     args = p.parse_args()
+
+    _print_debug_imports()
 
     dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16, "fp32": jnp.float32}[args.dtype]
 

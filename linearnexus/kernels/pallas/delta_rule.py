@@ -128,11 +128,13 @@ def delta_rule_recurrent_pallas(
         out_shape=out_shape,
         grid=(batch, heads),
         grid_names=("b", "h"),
-        # Single warpgroup is enough for correctness-first kernel.
+        # Correctness-first: single lane/thread.
+        # NOTE: Using lane semantics avoids a Lane/Warpgroup mismatch that can
+        # trigger Mosaic lowering failures for masked_load on some JAX builds.
         num_threads=1,
-        thread_name="wg",
+        thread_name="lane",
         compiler_params=plgpu.CompilerParams(
-            lowering_semantics=plgpu.LoweringSemantics.Warpgroup,
+            lowering_semantics=plgpu.LoweringSemantics.Lane,
         ),
     )
 
