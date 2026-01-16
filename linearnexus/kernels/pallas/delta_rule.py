@@ -25,6 +25,7 @@ import jax.numpy as jnp
 def _pallas_is_usable() -> bool:
     try:
         from jax.experimental import pallas as pl  # noqa: F401
+        import jax.experimental.pallas.mosaic_gpu as plgpu  # noqa: F401
     except Exception:
         return False
 
@@ -61,6 +62,7 @@ def delta_rule_recurrent_pallas(
         raise RuntimeError("Pallas backend is not usable (need JAX Pallas + GPU).")
 
     from jax.experimental import pallas as pl
+    import jax.experimental.pallas.mosaic_gpu as plgpu
 
     if beta.ndim == 4:
         beta = beta.squeeze(-1)
@@ -82,63 +84,57 @@ def delta_rule_recurrent_pallas(
     else:
         state_in = initial_state.astype(jnp.float32)
 
-    out_shape = (
-        jax.ShapeDtypeStruct((batch, heads, seq_len, value_dim), jnp.float32),
+    # Use Mosaic GPU backend directly. This aligns with patterns in docs/reference
+    # and avoids NaNs observed with `pl.pallas_call` on A100.
+    out_shape = [
+        jax.ShapeDtypeStruct((batch, heads, seq_len, value_dim), q.dtype),
         jax.ShapeDtypeStruct((batch, heads, key_dim, value_dim), jnp.float32),
-    )
-
-    q_spec = pl.BlockSpec((1, 1, seq_len, key_dim), lambda b, h: (b, h, 0, 0))
-    k_spec = pl.BlockSpec((1, 1, seq_len, key_dim), lambda b, h: (b, h, 0, 0))
-    v_spec = pl.BlockSpec((1, 1, seq_len, value_dim), lambda b, h: (b, h, 0, 0))
-    beta_spec = pl.BlockSpec((1, 1, seq_len), lambda b, h: (b, h, 0))
-    state_spec = pl.BlockSpec((1, 1, key_dim, value_dim), lambda b, h: (b, h, 0, 0))
-
-    out_spec = pl.BlockSpec((1, 1, seq_len, value_dim), lambda b, h: (b, h, 0, 0))
-    state_out_spec = pl.BlockSpec(
-        (1, 1, key_dim, value_dim), lambda b, h: (b, h, 0, 0)
-    )
+    ]
 
     scale_f32 = jnp.asarray(scale, dtype=jnp.float32)
 
     def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
-        # IMPORTANT (GPU semantics): Pallas kernels run SPMD over lanes/threads.
-        # Use vectorized indexing (`pl.arange`) so lanes write disjoint elements.
-        k_idx = pl.arange(0, key_dim)  # [K]
-        v_idx = pl.arange(0, value_dim)  # [V]
+        b = jax.lax.axis_index("b")
+        h = jax.lax.axis_index("h")
 
-        # Load full state tile: S[k, v] for this (batch, head).
         S = pl.load(
             state_in_ref,
-            (0, 0, k_idx[:, None], v_idx[None, :]),
+            (b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)),
         ).astype(jnp.float32)
 
         def body(t, S_carry):
-            k_t = pl.load(k_ref, (0, 0, t, k_idx)).astype(jnp.float32)  # [K]
-            v_t = pl.load(v_ref, (0, 0, t, v_idx)).astype(jnp.float32)  # [V]
+            k_t = pl.load(k_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
+            v_t = pl.load(v_ref, (b, h, t, pl.ds(0, value_dim))).astype(jnp.float32)
             q_t = (
-                pl.load(q_ref, (0, 0, t, k_idx)).astype(jnp.float32) * scale_f32
-            )  # [K]
-            beta_t = pl.load(beta_ref, (0, 0, t)).astype(jnp.float32)  # []
+                pl.load(q_ref, (b, h, t, pl.ds(0, key_dim))).astype(jnp.float32)
+                * scale_f32
+            )
+            beta_t = pl.load(beta_ref, (b, h, t)).astype(jnp.float32)
 
-            # v_old[v] = sum_k S[k, v] * k_t[k]
-            v_old = jnp.sum(S_carry * k_t[:, None], axis=0)  # [V]
-            v_delta = beta_t * (v_t - v_old)  # [V]
-            S_new = S_carry + k_t[:, None] * v_delta[None, :]  # [K, V]
+            v_old = jnp.einsum("kv,k->v", S_carry, k_t)
+            v_delta = beta_t * (v_t - v_old)
+            S_new = S_carry + jnp.einsum("k,v->kv", k_t, v_delta)
+            o_t = jnp.einsum("k,kv->v", q_t, S_new)
 
-            # o[v] = sum_k q_t[k] * S_new[k, v]
-            o_t = jnp.sum(S_new * q_t[:, None], axis=0)  # [V]
-            pl.store(out_ref, (0, 0, t, v_idx), o_t)
+            pl.store(out_ref, (b, h, t, pl.ds(0, value_dim)), o_t.astype(out_ref.dtype))
             return S_new
 
-        S = jax.lax.fori_loop(0, seq_len, body, S)
-        pl.store(state_out_ref, (0, 0, k_idx[:, None], v_idx[None, :]), S)
+        S_final = jax.lax.fori_loop(0, seq_len, body, S)
+        pl.store(
+            state_out_ref,
+            (b, h, pl.ds(0, key_dim), pl.ds(0, value_dim)),
+            S_final,
+        )
 
-    out_f32, state_out_f32 = pl.pallas_call(
+    compiled = plgpu.kernel(
         kernel,
         out_shape=out_shape,
-        in_specs=[q_spec, k_spec, v_spec, beta_spec, state_spec],
-        out_specs=[out_spec, state_out_spec],
         grid=(batch, heads),
-    )(q_f32, k_f32, v_f32, beta_f32, state_in)
+        grid_names=("b", "h"),
+        # Single warpgroup is enough for correctness-first kernel.
+        num_threads=1,
+        thread_name="wg",
+    )
 
-    return out_f32.astype(q.dtype), state_out_f32
+    out, state_out = compiled(q_f32, k_f32, v_f32, beta_f32, state_in)
+    return out, state_out

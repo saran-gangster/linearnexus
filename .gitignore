@@ -80,12 +80,6 @@ runs/
 jax_cache/
 __jax_cache__/
 
-# Optional Mosaic/Pallas reference drops (keep repo lean)
-docs/reference/
-docs/pallas_gpu_glossary.md
-docs/pallas_gpu_reference.md
-docs/pallas_patterns.md
-docs/pallas_tpu_reference.md
 
 # Model checkpoints and outputs
 checkpoints/
