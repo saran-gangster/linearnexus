@@ -5,7 +5,7 @@ kernels are planned for future releases (see archive/pallas_kernels/).
 
 Available kernels:
 - MambaReferenceKernel: Pure JAX selective SSM using lax.scan
-- Kernel backend utilities for Triton/Pallas integration
+- Kernel backend utilities for optional Pallas integration
 """
 
 from .mamba_reference import (

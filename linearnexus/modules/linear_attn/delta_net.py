@@ -69,7 +69,7 @@ from jax import lax
 import flax.nnx as nnx
 
 from ...kernels.backend import KernelBackend, select_kernel_backend
-from ...kernels.triton import delta_rule_recurrent_triton
+from ...kernels.pallas import delta_rule_recurrent_pallas
 
 from ...core.conv import depthwise_conv1d_causal
 
@@ -148,8 +148,12 @@ def delta_rule_recurrent(
         final_state: Final state [batch, heads, key_dim, value_dim]
     """
     backend_choice = select_kernel_backend(backend)
-    if backend_choice == KernelBackend.TRITON:
-        return delta_rule_recurrent_triton(q, k, v, beta, initial_state, scale)
+    if backend_choice == KernelBackend.PALLAS:
+        try:
+            return delta_rule_recurrent_pallas(q, k, v, beta, initial_state, scale)
+        except Exception:
+            # Always fall back to reference if Pallas isn't available/usable.
+            pass
 
     batch, heads, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
