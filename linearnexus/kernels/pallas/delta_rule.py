@@ -111,7 +111,6 @@ def delta_rule_recurrent_pallas(
             q_smem,
             k_smem,
             v_smem,
-            beta_smem,
             out_smem,
             state_smem,
             v_old_smem,
@@ -122,7 +121,6 @@ def delta_rule_recurrent_pallas(
             q_barrier,
             k_barrier,
             v_barrier,
-            beta_barrier,
             out_barrier,
             state_barrier,
         ) = scoped
@@ -151,21 +149,17 @@ def delta_rule_recurrent_pallas(
                 v_smem,
                 v_barrier.at[0],
             )
-            plgpu.copy_gmem_to_smem(
-                beta_ref.at[b, h, pl.ds(t, 1)],
-                beta_smem,
-                beta_barrier.at[0],
-            )
 
             plgpu.barrier_wait(q_barrier.at[0])
             plgpu.barrier_wait(k_barrier.at[0])
             plgpu.barrier_wait(v_barrier.at[0])
-            plgpu.barrier_wait(beta_barrier.at[0])
 
             # Mosaic GPU lowering (JAX 0.8.2) currently rejects general
             # broadcasting primitives. Implement delta-rule with explicit
             # scalar loops over fixed sizes.
-            beta_t = beta_smem.at[0][...]
+            # NOTE: Mosaic GPU TMA copies must be multiples of 128 bytes.
+            # Loading beta via TMA (4 bytes) fails. Instead, use a scalar load.
+            beta_t = pl.load(beta_ref, (b, h, t)).astype(jnp.float32)
 
             # Zero accumulators without broadcasting.
             qk_smem.at[0][...] = jnp.array(0.0, dtype=jnp.float32)
@@ -234,7 +228,6 @@ def delta_rule_recurrent_pallas(
         q_smem = plgpu.SMEM((key_dim,), jnp.float32)
         k_smem = plgpu.SMEM((key_dim,), jnp.float32)
         v_smem = plgpu.SMEM((value_dim,), jnp.float32)
-        beta_smem = plgpu.SMEM((1,), jnp.float32)
         out_smem = plgpu.SMEM((value_dim,), q.dtype)
         state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
         v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
@@ -243,9 +236,8 @@ def delta_rule_recurrent_pallas(
         qk_smem = plgpu.SMEM((1,), jnp.float32)
         pl.run_scoped(
             lambda *scoped: kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref, scoped),
-            (q_smem, k_smem, v_smem, beta_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
+            (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
             (
-                plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
