@@ -157,44 +157,43 @@ def delta_rule_recurrent_pallas(
             plgpu.barrier_wait(k_barrier.at[0])
             plgpu.barrier_wait(v_barrier.at[0])
 
+            # NOTE: Under Mosaic GPU Warpgroup semantics (JAX 0.8.2), dynamic
+            # indexing into Pallas Refs often lowers to `lax.dynamic_slice`,
+            # which is currently unimplemented. To stay within supported
+            # primitives, load SMEM tiles as values and use *static* (Python)
+            # indices for per-element access.
+            q_vec = q_smem[...]
+            k_vec = k_smem[...]
+            v_tile = v_smem[...]
+
             # Use register vectors for accumulation to avoid races / amplification
             # across the 128 threads in a warpgroup.
-            beta_t = v_smem.at[value_dim][...]
-            v_vec = v_smem[:value_dim]
+            beta_t = v_tile[value_dim]
+            v_vec = v_tile[:value_dim]
 
-            def accum_step(i, carry):
-                v_old, o_base, qk = carry
-                k_i = k_smem.at[i][...]
-                q_i = q_smem.at[i][...]
+            v_old = jnp.zeros((value_dim,), dtype=jnp.float32)
+            o_base = jnp.zeros((value_dim,), dtype=jnp.float32)
+            qk = jnp.array(0.0, dtype=jnp.float32)
+
+            for i in range(key_dim):
+                k_i = k_vec[i]
+                q_i = q_vec[i]
                 row = state_smem[i, :]
                 v_old = v_old + row * k_i
                 o_base = o_base + row * q_i
                 qk = qk + (q_i * k_i)
-                return v_old, o_base, qk
-
-            v_old0 = jnp.zeros((value_dim,), dtype=jnp.float32)
-            o_base0 = jnp.zeros((value_dim,), dtype=jnp.float32)
-            qk0 = jnp.array(0.0, dtype=jnp.float32)
-            v_old, o_base, qk = jax.lax.fori_loop(0, key_dim, accum_step, (v_old0, o_base0, qk0))
 
             v_delta = beta_t * (v_vec - v_old)
-            out_vec = o_base + qk * v_delta
+            out_vec = o_base + (qk * v_delta)
             out_smem[...] = out_vec.astype(out_ref.dtype)
 
-            def update_step(i, _):
-                k_i = k_smem.at[i][...]
-
-                # Avoid vector stores to SMEM slices; write elementwise.
-                row = state_smem[i, :]
-                row_new = row + k_i * v_delta
-
-                @pl.loop(0, value_dim)
-                def _store_j(j):
+            # Update state_smem in-place (elementwise stores are the most
+            # robust w.r.t. layout inference).
+            for i in range(key_dim):
+                k_i = k_vec[i]
+                row_new = state_smem[i, :] + k_i * v_delta
+                for j in range(value_dim):
                     state_smem.at[i, j][...] = row_new[j]
-
-                return None
-
-            jax.lax.fori_loop(0, key_dim, update_step, None)
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
