@@ -120,6 +120,9 @@ def delta_rule_recurrent_pallas(
             v_smem,
             out_smem,
             state_smem,
+            v_old_smem,
+            o_base_smem,
+            v_delta_smem,
         ), (
             q_barrier,
             k_barrier,
@@ -157,41 +160,49 @@ def delta_rule_recurrent_pallas(
             plgpu.barrier_wait(k_barrier.at[0])
             plgpu.barrier_wait(v_barrier.at[0])
 
-            # NOTE: Under Mosaic GPU Warpgroup semantics (JAX 0.8.2), dynamic
-            # indexing into Pallas Refs often lowers to `lax.dynamic_slice`,
-            # which is currently unimplemented. To stay within supported
-            # primitives, load SMEM tiles as values and use *static* (Python)
-            # indices for per-element access.
+            # Reset scratch accumulators.
+            v_old_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
+            o_base_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
+
             q_vec = q_smem[...]
             k_vec = k_smem[...]
-            v_tile = v_smem[...]
-            state = state_smem[...]
-
-            # IMPORTANT: Avoid scalar indexing (x[i]) inside Warpgroup semantics.
-            # In JAX 0.8.2 Mosaic GPU lowering, scalar extraction frequently lowers
-            # to `lax.squeeze`, which is currently unimplemented.
-            beta_vec = v_tile[value_dim : value_dim + 1]  # [1]
-            v_vec = v_tile[:value_dim]  # [value_dim]
-
-            # v_old = sum_i state[i, :] * k[i]
-            # o_base = sum_i state[i, :] * q[i]
-            # qk = sum_i q[i] * k[i]
-            # NOTE: Avoid implicit broadcasting in Warpgroup semantics.
-            k_mat = jax.lax.broadcast_in_dim(k_vec, (key_dim, value_dim), (0,))
-            q_mat = jax.lax.broadcast_in_dim(q_vec, (key_dim, value_dim), (0,))
-            v_old = jnp.sum(state * k_mat, axis=0)
-            o_base = jnp.sum(state * q_mat, axis=0)
             qk = jnp.sum(q_vec * k_vec)
 
-            beta_full = jax.lax.broadcast_in_dim(beta_vec, (value_dim,), (0,))
-            v_delta = (v_vec - v_old) * beta_full
+            # Accumulate v_old and o_base via a loop over key_dim.
+            def accum_step(i, _):
+                k_i = k_smem.at[i][...]
+                q_i = q_smem.at[i][...]
+                row = state_smem[i, :]
+                k_i_vec = jax.lax.broadcast_in_dim(k_i, (value_dim,), ())
+                q_i_vec = jax.lax.broadcast_in_dim(q_i, (value_dim,), ())
+                v_old_smem[...] = v_old_smem[...] + row * k_i_vec
+                o_base_smem[...] = o_base_smem[...] + row * q_i_vec
+                return None
+
+            jax.lax.fori_loop(0, key_dim, accum_step, None)
+
+            v_old = v_old_smem[...]
+            o_base = o_base_smem[...]
+
+            v_tile = v_smem[...]
+            v_vec = v_tile[:value_dim]
+            beta_t = v_smem.at[value_dim][...]
+            beta_vec = jax.lax.broadcast_in_dim(beta_t, (value_dim,), ())
+            v_delta = beta_vec * (v_vec - v_old)
+            v_delta_smem[...] = v_delta
+
             out_vec = o_base + qk * v_delta
             out_smem[...] = out_vec.astype(out_ref.dtype)
 
-            # State update: state += k[:, None] * v_delta[None, :]
-            # Full-tile SMEM store avoids scalar stores that can trigger squeeze.
-            v_mat = jax.lax.broadcast_in_dim(v_delta, (key_dim, value_dim), (1,))
-            state_smem[...] = state + k_mat * v_mat
+            # Update state_smem elementwise to keep layout inference happy.
+            def update_i(i, _):
+                k_i = k_smem.at[i][...]
+                @pl.loop(0, value_dim)
+                def _update_j(j):
+                    state_smem.at[i, j][...] = state_smem.at[i, j][...] + k_i * v_delta_smem.at[j][...]
+                return None
+
+            jax.lax.fori_loop(0, key_dim, update_i, None)
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
@@ -217,9 +228,12 @@ def delta_rule_recurrent_pallas(
         v_smem = plgpu.SMEM((value_dim_padded,), jnp.float32)
         out_smem = plgpu.SMEM((value_dim,), q.dtype)
         state_smem = plgpu.SMEM((key_dim, value_dim), jnp.float32)
+        v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        o_base_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        v_delta_smem = plgpu.SMEM((value_dim,), jnp.float32)
         pl.run_scoped(
             lambda *scoped: kernel(q_ref, k_ref, v_ref, state_in_ref, out_ref, state_out_ref, scoped),
-            (q_smem, k_smem, v_smem, out_smem, state_smem),
+            (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem),
             (
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
