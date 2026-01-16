@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
   "jax>=0.4.28",
   "jaxlib>=0.4.28",
+  "jax-triton>=0.3.0",
   "flax>=0.12.1,<0.12.3",
   "optax>=0.2.3",
   "numpy>=1.26.0",
@@ -37,6 +38,9 @@ full = [
   "tiktoken>=0.5.0",      # BPE tokenizer
   "wandb>=0.16.0",        # Logging
   "tqdm>=4.66.0",         # Progress bars
+]
+triton = [
+  "jax-triton>=0.3.0",
 ]
 # NVIDIA CUDA 12 installation (Linux only)
 # Usage: pip install -e ".[cuda12]"

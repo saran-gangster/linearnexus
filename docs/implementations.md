@@ -194,6 +194,17 @@ Based on [flash-linear-attention (FLA)](https://github.com/fla-org/flash-linear-
 - `examples/fla/ops/delta_rule/naive.py` - Reference recurrent kernel
 - `examples/fla/ops/delta_rule/README.md` - WY representation derivation
 
+### Kernel Backends (JAX-Triton)
+
+DeltaNet now supports a modular kernel backend selector for GPU-accelerated
+implementations. The Triton backend currently provides a fused recurrent
+forward kernel (with reference backward) and falls back to the pure JAX
+implementation when GPU kernels are unavailable.
+
+Backend selection can be configured via the `LINEARNEXUS_KERNEL_BACKEND`
+environment variable or by passing `backend="triton"` to the core kernel
+functions. On CPU-only machines, the reference kernels are used automatically.
+
 ---
 
 ## Gated DeltaNet: Combining Mamba2 Gating with Delta Rule

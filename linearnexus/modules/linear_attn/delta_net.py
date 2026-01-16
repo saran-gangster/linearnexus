@@ -68,6 +68,9 @@ import jax.numpy as jnp
 from jax import lax
 import flax.nnx as nnx
 
+from ...kernels.backend import KernelBackend, select_kernel_backend
+from ...kernels.triton import delta_rule_recurrent_triton
+
 from ...core.conv import depthwise_conv1d_causal
 
 
@@ -127,6 +130,7 @@ def delta_rule_recurrent(
     beta: jax.Array,  # [batch, heads, seq_len]
     initial_state: Optional[jax.Array] = None,  # [batch, heads, key_dim, value_dim]
     scale: Optional[float] = None,
+    backend: Optional[str] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Token-by-token delta rule recurrence (Reference Implementation).
 
@@ -143,6 +147,10 @@ def delta_rule_recurrent(
         output: Output tensor [batch, heads, seq_len, value_dim]
         final_state: Final state [batch, heads, key_dim, value_dim]
     """
+    backend_choice = select_kernel_backend(backend)
+    if backend_choice == KernelBackend.TRITON:
+        return delta_rule_recurrent_triton(q, k, v, beta, initial_state, scale)
+
     batch, heads, seq_len, key_dim = q.shape
     value_dim = v.shape[-1]
     orig_dtype = q.dtype
@@ -209,6 +217,7 @@ def delta_rule_chunkwise(
     initial_state: Optional[jax.Array] = None,
     chunk_size: int = 64,
     scale: Optional[float] = None,
+    backend: Optional[str] = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Chunkwise parallel delta rule using WY representation.
 
