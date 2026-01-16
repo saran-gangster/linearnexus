@@ -101,34 +101,37 @@ def delta_rule_recurrent_pallas(
     scale_f32 = jnp.asarray(scale, dtype=jnp.float32)
 
     def kernel(q_ref, k_ref, v_ref, beta_ref, state_in_ref, out_ref, state_out_ref):
+        # IMPORTANT (GPU semantics): Pallas kernels run SPMD over lanes/threads.
+        # Use vectorized indexing (`pl.arange`) so lanes write disjoint elements.
+        k_idx = pl.arange(0, key_dim)  # [K]
+        v_idx = pl.arange(0, value_dim)  # [V]
+
+        # Load full state tile: S[k, v] for this (batch, head).
         S = pl.load(
             state_in_ref,
-            (0, 0, pl.ds(0, key_dim), pl.ds(0, value_dim)),
+            (0, 0, k_idx[:, None], v_idx[None, :]),
         ).astype(jnp.float32)
 
         def body(t, S_carry):
-            k_t = pl.load(k_ref, (0, 0, t, pl.ds(0, key_dim))).astype(jnp.float32)
-            v_t = pl.load(v_ref, (0, 0, t, pl.ds(0, value_dim))).astype(jnp.float32)
+            k_t = pl.load(k_ref, (0, 0, t, k_idx)).astype(jnp.float32)  # [K]
+            v_t = pl.load(v_ref, (0, 0, t, v_idx)).astype(jnp.float32)  # [V]
             q_t = (
-                pl.load(q_ref, (0, 0, t, pl.ds(0, key_dim))).astype(jnp.float32)
-                * scale_f32
-            )
-            beta_t = pl.load(beta_ref, (0, 0, t)).astype(jnp.float32)
+                pl.load(q_ref, (0, 0, t, k_idx)).astype(jnp.float32) * scale_f32
+            )  # [K]
+            beta_t = pl.load(beta_ref, (0, 0, t)).astype(jnp.float32)  # []
 
-            v_old = jnp.einsum("kv,k->v", S_carry, k_t)
-            v_delta = beta_t * (v_t - v_old)
-            S_new = S_carry + jnp.einsum("k,v->kv", k_t, v_delta)
-            o_t = jnp.einsum("k,kv->v", q_t, S_new)
+            # v_old[v] = sum_k S[k, v] * k_t[k]
+            v_old = jnp.sum(S_carry * k_t[:, None], axis=0)  # [V]
+            v_delta = beta_t * (v_t - v_old)  # [V]
+            S_new = S_carry + k_t[:, None] * v_delta[None, :]  # [K, V]
 
-            pl.store(out_ref, (0, 0, t, pl.ds(0, value_dim)), o_t)
+            # o[v] = sum_k q_t[k] * S_new[k, v]
+            o_t = jnp.sum(S_new * q_t[:, None], axis=0)  # [V]
+            pl.store(out_ref, (0, 0, t, v_idx), o_t)
             return S_new
 
         S = jax.lax.fori_loop(0, seq_len, body, S)
-        pl.store(
-            state_out_ref,
-            (0, 0, pl.ds(0, key_dim), pl.ds(0, value_dim)),
-            S,
-        )
+        pl.store(state_out_ref, (0, 0, k_idx[:, None], v_idx[None, :]), S)
 
     out_f32, state_out_f32 = pl.pallas_call(
         kernel,
