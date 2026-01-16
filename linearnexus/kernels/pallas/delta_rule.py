@@ -123,6 +123,7 @@ def delta_rule_recurrent_pallas(
             v_old_smem,
             o_base_smem,
             v_delta_smem,
+            qk_smem,
         ), (
             q_barrier,
             k_barrier,
@@ -163,46 +164,42 @@ def delta_rule_recurrent_pallas(
             # Reset scratch accumulators.
             v_old_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
             o_base_smem[...] = jnp.zeros((value_dim,), dtype=jnp.float32)
+            qk_smem[...] = jnp.array(0.0, dtype=jnp.float32)
 
-            q_vec = q_smem[...]
-            k_vec = k_smem[...]
-            qk = jnp.sum(q_vec * k_vec)
-
-            # Accumulate v_old and o_base via a loop over key_dim.
-            def accum_step(i, _):
+            # Accumulate v_old[j] = sum_i state[i,j]*k[i], o_base[j] = sum_i state[i,j]*q[i]
+            # and qk = sum_i q[i]*k[i] using scalar SMEM loads/stores only.
+            @pl.loop(0, key_dim)
+            def _accum_i(i):
                 k_i = k_smem.at[i][...]
                 q_i = q_smem.at[i][...]
-                row = state_smem[i, :]
-                k_i_vec = jax.lax.broadcast_in_dim(k_i, (value_dim,), ())
-                q_i_vec = jax.lax.broadcast_in_dim(q_i, (value_dim,), ())
-                v_old_smem[...] = v_old_smem[...] + row * k_i_vec
-                o_base_smem[...] = o_base_smem[...] + row * q_i_vec
-                return None
+                qk_smem[...] = qk_smem[...] + q_i * k_i
 
-            jax.lax.fori_loop(0, key_dim, accum_step, None)
+                @pl.loop(0, value_dim)
+                def _accum_j(j):
+                    s_ij = state_smem.at[i, j][...]
+                    v_old_smem.at[j][...] = v_old_smem.at[j][...] + s_ij * k_i
+                    o_base_smem.at[j][...] = o_base_smem.at[j][...] + s_ij * q_i
 
-            v_old = v_old_smem[...]
-            o_base = o_base_smem[...]
-
-            v_tile = v_smem[...]
-            v_vec = v_tile[:value_dim]
             beta_t = v_smem.at[value_dim][...]
-            beta_vec = jax.lax.broadcast_in_dim(beta_t, (value_dim,), ())
-            v_delta = beta_vec * (v_vec - v_old)
-            v_delta_smem[...] = v_delta
 
-            out_vec = o_base + qk * v_delta
-            out_smem[...] = out_vec.astype(out_ref.dtype)
+            # Compute v_delta[j] and out[j] elementwise.
+            @pl.loop(0, value_dim)
+            def _compute_out_j(j):
+                v_j = v_smem.at[j][...]
+                v_old_j = v_old_smem.at[j][...]
+                v_delta_j = beta_t * (v_j - v_old_j)
+                v_delta_smem.at[j][...] = v_delta_j
+                out_j = o_base_smem.at[j][...] + qk_smem[...] * v_delta_j
+                out_smem.at[j][...] = out_j.astype(out_ref.dtype)
 
-            # Update state_smem elementwise to keep layout inference happy.
-            def update_i(i, _):
+            # State update: state[i,j] += k[i] * v_delta[j]
+            @pl.loop(0, key_dim)
+            def _update_i(i):
                 k_i = k_smem.at[i][...]
+
                 @pl.loop(0, value_dim)
                 def _update_j(j):
                     state_smem.at[i, j][...] = state_smem.at[i, j][...] + k_i * v_delta_smem.at[j][...]
-                return None
-
-            jax.lax.fori_loop(0, key_dim, update_i, None)
 
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(
@@ -231,9 +228,10 @@ def delta_rule_recurrent_pallas(
         v_old_smem = plgpu.SMEM((value_dim,), jnp.float32)
         o_base_smem = plgpu.SMEM((value_dim,), jnp.float32)
         v_delta_smem = plgpu.SMEM((value_dim,), jnp.float32)
+        qk_smem = plgpu.SMEM((), jnp.float32)
         pl.run_scoped(
             lambda *scoped: kernel(q_ref, k_ref, v_ref, state_in_ref, out_ref, state_out_ref, scoped),
-            (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem),
+            (q_smem, k_smem, v_smem, out_smem, state_smem, v_old_smem, o_base_smem, v_delta_smem, qk_smem),
             (
                 plgpu.Barrier(num_barriers=1),
                 plgpu.Barrier(num_barriers=1),
